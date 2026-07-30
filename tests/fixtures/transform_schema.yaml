@@ -1,0 +1,16 @@
+target_columns:
+  - name: product_name
+    type: string
+    required: true
+  - name: unit_price
+    type: decimal
+    required: true
+  - name: sold_on
+    type: date
+    required: true
+  - name: stock_quantity
+    type: integer
+    required: false
+output:
+  format: csv
+  add_provenance: true

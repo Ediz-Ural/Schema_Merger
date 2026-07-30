@@ -1,0 +1,40 @@
+- target_column: product_name
+  sources:
+    - file: transform_sales_tr.csv
+      column: urun
+      confidence: 1.0
+      status: auto
+    - file: transform_export_en.csv
+      column: product
+      confidence: 1.0
+      status: auto
+- target_column: unit_price
+  sources:
+    - file: transform_sales_tr.csv
+      column: fiyat
+      confidence: 1.0
+      status: auto
+    - file: transform_export_en.csv
+      column: price
+      confidence: 1.0
+      status: auto
+- target_column: sold_on
+  sources:
+    - file: transform_sales_tr.csv
+      column: tarih
+      confidence: 1.0
+      status: auto
+    - file: transform_export_en.csv
+      column: date
+      confidence: 1.0
+      status: auto
+- target_column: stock_quantity
+  sources:
+    - file: transform_sales_tr.csv
+      column: null
+      confidence: 0.0
+      status: unmatched
+    - file: transform_export_en.csv
+      column: null
+      confidence: 0.0
+      status: unmatched

@@ -1,0 +1,1 @@
+"""Schema Merger test suite."""

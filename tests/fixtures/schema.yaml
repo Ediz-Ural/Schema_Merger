@@ -1,0 +1,13 @@
+target_columns:
+  - name: product_name
+    type: string
+    required: true
+  - name: unit_price
+    type: decimal
+    required: true
+  - name: stock_quantity
+    type: integer
+    required: false
+output:
+  format: xlsx
+  add_provenance: true

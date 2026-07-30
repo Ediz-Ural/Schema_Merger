@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schema-merger"
+version = "0.1.0"
+description = "Deterministic profiling for heterogeneous Excel and CSV tables."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "Schema Merger contributors" }]
+dependencies = [
+    "pandas>=2.0",
+    "polars>=0.20",
+    "openpyxl>=3.1",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+merger = "cli.main:main"
+
+[tool.setuptools]
+packages = ["core", "cli"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider --basetemp=.pytest-tmp"
