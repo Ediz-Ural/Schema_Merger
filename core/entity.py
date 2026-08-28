@@ -1,8 +1,9 @@
-"""Entity resolution layers 1-2: deterministic normalization and blocking.
+"""Entity resolution: normalization, blocking, embedding, and the grey zone.
 
-Entity resolution (spec §4, §7) has four layers.  This module implements the
-first two, and both are **pure code — no LLM is called here** (spec §14).  The
-LLM only sees the grey zone in a later layer.
+Entity resolution (spec §4, §7) has four layers, cheapest first, and this
+module implements all of them.  Layers 1-3 are decided by code alone; the LLM
+is reached only in layer 4, for the pairs that sit between the two thresholds
+(spec §14).
 
 Layer 1 — :func:`normalize` produces a comparison key for a value:
 Turkish-aware lowercasing, diacritic folding, number canonicalisation, unit
@@ -13,6 +14,20 @@ rewritten, so provenance stays intact.
 Layer 2 — :func:`make_blocks` groups records that are worth comparing at all.
 Comparing every pair is quadratic and therefore forbidden here; candidates come
 from :func:`candidate_pairs`, which never leaves a block.
+
+Layer 3 — :func:`score_pairs` embeds the comparison keys of blocked pairs and
+scores them with cosine similarity.  Two thresholds split the result: at or
+above ``high`` the pair is the same product, below ``low`` it is a different
+one, and both verdicts are reached without an LLM.
+
+Layer 4 — :func:`review_grey_zone` sends what is left, the band between the
+thresholds, to the LLM one pair at a time.  That band is meant to stay a small
+fraction of all pairs (:func:`grey_zone_ratio` measures it), which is what
+keeps the cost bounded as record count grows.  The LLM is **advisory only**: a
+grey pair keeps ``status="review"`` whatever the answer, so it reaches a human
+in the cluster approval step and never merges on its own.  A malformed,
+low-confidence, or failed answer leaves the pair ``"undecided"`` — it is never
+quietly read as "same".
 
 Documented defaults
 -------------------
@@ -36,8 +51,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal, DecimalException
 from functools import lru_cache
 from itertools import combinations
+import json
+import math
 import re
-from typing import Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, Sequence
+
+from core.llm import EmbeddingClient, LLMClient
 
 
 class EntityError(ValueError):
@@ -53,6 +72,32 @@ DEFAULT_PREFIX_LENGTH = 3
 
 #: Blocking strategies accepted by :func:`make_blocks`.
 BLOCKING_STRATEGIES = ("prefix", "brand", "category")
+
+#: Similarity at or above which a pair is the same product without an LLM.
+DEFAULT_HIGH_THRESHOLD = 0.85
+
+#: Similarity below which a pair is a different product without an LLM.
+DEFAULT_LOW_THRESHOLD = 0.60
+
+#: Least confidence an LLM suggestion needs before it is recorded at all.
+DEFAULT_LLM_MIN_CONFIDENCE = 0.5
+
+#: Verdict for a pair.  ``"undecided"`` means no layer could answer safely.
+DECISION_SAME = "same"
+DECISION_DIFFERENT = "different"
+DECISION_UNDECIDED = "undecided"
+
+#: Which layer produced the verdict.
+SOURCE_EMBEDDING = "embedding"
+SOURCE_LLM = "llm"
+SOURCE_NONE = "none"
+
+_GREY_SYSTEM_PROMPT = """You judge whether two product descriptions refer to the same real-world product.
+Return only JSON: {"same": true, "confidence": 0.0, "reason": "..."}.
+"same" must be a boolean and "confidence" a number between 0 and 1.
+Judge only the two supplied descriptions; do not invent attributes, do not request
+more data, and do not return anything but that JSON object. Your answer is advisory:
+a human confirms every merge, so answer "same": false when you are not convinced."""
 
 #: Unit token -> (factor, base unit).  See the module docstring.
 DEFAULT_UNITS: dict[str, tuple[Decimal, str]] = {
@@ -265,6 +310,358 @@ def all_pairs_count(record_count: int) -> int:
     """Pairs a naive all-pairs comparison would need; for reporting only."""
 
     return record_count * (record_count - 1) // 2
+
+
+@dataclass(frozen=True)
+class SimilarityThresholds:
+    """The two cut-offs that define the grey zone, plus the LLM trust floor.
+
+    ``high`` and ``low`` bound the band that is escalated: ``similarity >=
+    high`` is decided as the same product and ``similarity < low`` as a
+    different one, both without an LLM.  Widening the band buys accuracy with
+    LLM calls; narrowing it does the reverse.  ``llm_min_confidence`` is the
+    least confidence a suggestion needs before it is recorded — under it the
+    pair stays undecided.
+    """
+
+    high: float = DEFAULT_HIGH_THRESHOLD
+    low: float = DEFAULT_LOW_THRESHOLD
+    llm_min_confidence: float = DEFAULT_LLM_MIN_CONFIDENCE
+
+    def __post_init__(self) -> None:
+        for name in ("high", "low", "llm_min_confidence"):
+            value = getattr(self, name)
+            if not 0.0 <= value <= 1.0:
+                raise EntityError(f"{name} must be between 0 and 1")
+        if self.low > self.high:
+            raise EntityError("low threshold cannot exceed high threshold")
+
+
+DEFAULT_THRESHOLDS = SimilarityThresholds()
+
+
+@dataclass(frozen=True)
+class PairDecision:
+    """One candidate pair and how far the layers got with it.
+
+    ``status`` is ``"auto"`` only when code alone settled the pair; every grey
+    pair stays ``"review"`` so the user confirms it later.  ``grey`` records
+    that the similarity fell in the band, which stays true after the LLM
+    answers — it describes how the pair was routed, not whether it is resolved.
+    """
+
+    left: BlockedRecord
+    right: BlockedRecord
+    similarity: float
+    decision: str
+    status: str
+    source: str
+    reason: str
+    grey: bool = False
+    llm_confidence: float | None = None
+
+    @property
+    def block_key(self) -> str:
+        return self.left.block_key
+
+
+def score_pairs(
+    pairs: Iterable[tuple[BlockedRecord, BlockedRecord]],
+    embedder: EmbeddingClient,
+    *,
+    thresholds: SimilarityThresholds | None = None,
+) -> list[PairDecision]:
+    """Layer 3: score blocked pairs by embedding similarity, no LLM involved.
+
+    Every distinct comparison key is embedded once, in a single
+    :meth:`~core.llm.EmbeddingClient.embed` call, so cost tracks distinct keys
+    rather than pair count.  Similarity is cosine, clamped to ``[0, 1]``: an
+    opposing vector is as different as an orthogonal one for our purposes.
+
+    Pairs whose similarity lands in the grey band come back ``"undecided"`` and
+    ``grey=True``, ready for :func:`review_grey_zone`.  A pair whose key
+    normalised to nothing is never guessed at — it comes back undecided too.
+    """
+
+    settings = thresholds or DEFAULT_THRESHOLDS
+    candidates = list(pairs)
+    vectors = _embed_keys(candidates, embedder)
+
+    decisions: list[PairDecision] = []
+    for left, right in candidates:
+        if not left.normalized or not right.normalized:
+            decisions.append(
+                _undecided(left, right, 0.0, SOURCE_NONE, "Karşılaştırma anahtarı boş; el ile incelenmeli.")
+            )
+            continue
+        similarity = _cosine(vectors[left.normalized], vectors[right.normalized])
+        decisions.append(_classify(left, right, similarity, settings))
+    return decisions
+
+
+def review_grey_zone(
+    decisions: Iterable[PairDecision],
+    llm: LLMClient,
+    *,
+    thresholds: SimilarityThresholds | None = None,
+) -> list[PairDecision]:
+    """Layer 4: ask the LLM about the grey band only, one pair per call.
+
+    Pairs already settled by layer 3 are passed through untouched, so the
+    number of requests equals the number of grey pairs — see
+    :func:`grey_zone_ratio`.  Only the two compared values and their normalised
+    keys are sent; the surrounding record and its other columns never leave.
+
+    The answer is a suggestion: the pair keeps ``status="review"`` either way.
+    Anything unusable — invalid JSON, a missing or non-boolean ``same``, a
+    confidence below ``llm_min_confidence``, or a provider failure — leaves the
+    pair ``"undecided"`` rather than merged.
+    """
+
+    settings = thresholds or DEFAULT_THRESHOLDS
+    reviewed: list[PairDecision] = []
+    for decision in decisions:
+        if not decision.grey or decision.source == SOURCE_LLM:
+            reviewed.append(decision)
+            continue
+        reviewed.append(_ask_llm(decision, llm, settings))
+    return reviewed
+
+
+def resolve_pairs(
+    blocks: Mapping[str, Sequence[BlockedRecord]],
+    *,
+    embedder: EmbeddingClient,
+    llm: LLMClient | None = None,
+    thresholds: SimilarityThresholds | None = None,
+    include_unblocked: bool = True,
+) -> list[PairDecision]:
+    """Run layers 3 and 4 over the blocks produced by :func:`make_blocks`.
+
+    Without ``llm`` the grey band is simply left undecided for the user.
+    """
+
+    settings = thresholds or DEFAULT_THRESHOLDS
+    decisions = score_pairs(
+        candidate_pairs(blocks, include_unblocked=include_unblocked),
+        embedder,
+        thresholds=settings,
+    )
+    if llm is None:
+        return decisions
+    return review_grey_zone(decisions, llm, thresholds=settings)
+
+
+def grey_pairs(decisions: Iterable[PairDecision]) -> list[PairDecision]:
+    """The pairs that fell in the band — the only ones an LLM ever sees."""
+
+    return [decision for decision in decisions if decision.grey]
+
+
+def grey_zone_ratio(decisions: Sequence[PairDecision]) -> float:
+    """Share of pairs that need an LLM call, ``0.0`` when there are no pairs.
+
+    The spec budgets roughly 1-5%; a materially larger share means the
+    thresholds or the blocking strategy need tightening before scaling up.
+    """
+
+    if not decisions:
+        return 0.0
+    return len(grey_pairs(decisions)) / len(decisions)
+
+
+def pending_review(decisions: Iterable[PairDecision]) -> list[PairDecision]:
+    """Pairs a human still has to confirm; ``apply`` must not merge these."""
+
+    return [decision for decision in decisions if decision.status == "review"]
+
+
+def _classify(
+    left: BlockedRecord,
+    right: BlockedRecord,
+    similarity: float,
+    thresholds: SimilarityThresholds,
+) -> PairDecision:
+    if similarity >= thresholds.high:
+        return PairDecision(
+            left=left,
+            right=right,
+            similarity=similarity,
+            decision=DECISION_SAME,
+            status="auto",
+            source=SOURCE_EMBEDDING,
+            reason=f"Benzerlik {similarity:.2f} >= {thresholds.high:.2f} (yüksek eşik).",
+        )
+    if similarity < thresholds.low:
+        return PairDecision(
+            left=left,
+            right=right,
+            similarity=similarity,
+            decision=DECISION_DIFFERENT,
+            status="auto",
+            source=SOURCE_EMBEDDING,
+            reason=f"Benzerlik {similarity:.2f} < {thresholds.low:.2f} (düşük eşik).",
+        )
+    return PairDecision(
+        left=left,
+        right=right,
+        similarity=similarity,
+        decision=DECISION_UNDECIDED,
+        status="review",
+        source=SOURCE_EMBEDDING,
+        reason=(
+            f"Benzerlik {similarity:.2f}, gri bölgede "
+            f"[{thresholds.low:.2f}, {thresholds.high:.2f}); LLM'e sorulacak."
+        ),
+        grey=True,
+    )
+
+
+def _undecided(
+    left: BlockedRecord,
+    right: BlockedRecord,
+    similarity: float,
+    source: str,
+    reason: str,
+    *,
+    grey: bool = False,
+    llm_confidence: float | None = None,
+) -> PairDecision:
+    return PairDecision(
+        left=left,
+        right=right,
+        similarity=similarity,
+        decision=DECISION_UNDECIDED,
+        status="review",
+        source=source,
+        reason=reason,
+        grey=grey,
+        llm_confidence=llm_confidence,
+    )
+
+
+def _embed_keys(
+    pairs: Sequence[tuple[BlockedRecord, BlockedRecord]], embedder: EmbeddingClient
+) -> dict[str, list[float]]:
+    """Embed each distinct non-empty comparison key exactly once."""
+
+    keys: list[str] = []
+    seen: set[str] = set()
+    for left, right in pairs:
+        for record in (left, right):
+            if record.normalized and record.normalized not in seen:
+                seen.add(record.normalized)
+                keys.append(record.normalized)
+    if not keys:
+        return {}
+
+    vectors = list(embedder.embed(keys))
+    if len(vectors) != len(keys):
+        raise EntityError(
+            f"Embedding sağlayıcısı {len(keys)} anahtar için {len(vectors)} vektör döndürdü."
+        )
+    dimensions = {len(vector) for vector in vectors}
+    if len(dimensions) > 1 or dimensions == {0}:
+        raise EntityError("Embedding vektörleri boş ya da farklı boyutlarda.")
+    return dict(zip(keys, ([float(value) for value in vector] for vector in vectors)))
+
+
+def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+    """Cosine similarity clamped to ``[0, 1]``; a zero vector scores 0."""
+
+    dot = sum(a * b for a, b in zip(left, right))
+    magnitude = math.sqrt(sum(a * a for a in left)) * math.sqrt(sum(b * b for b in right))
+    if magnitude == 0.0:
+        return 0.0
+    return max(0.0, min(1.0, dot / magnitude))
+
+
+def _ask_llm(
+    decision: PairDecision, llm: LLMClient, thresholds: SimilarityThresholds
+) -> PairDecision:
+    try:
+        response = llm.complete(_GREY_SYSTEM_PROMPT, _grey_user_prompt(decision))
+    except Exception as error:  # noqa: BLE001 - one bad pair must not stop the batch
+        return _undecided(
+            decision.left,
+            decision.right,
+            decision.similarity,
+            SOURCE_LLM,
+            f"LLM çağrısı başarısız: {error}. Çift incelenecek olarak kaldı.",
+            grey=True,
+        )
+
+    suggestion, error_message = _parse_suggestion(response, thresholds)
+    if suggestion is None:
+        return _undecided(
+            decision.left,
+            decision.right,
+            decision.similarity,
+            SOURCE_LLM,
+            f"{error_message} Çift incelenecek olarak kaldı.",
+            grey=True,
+        )
+    verdict = DECISION_SAME if suggestion["same"] else DECISION_DIFFERENT
+    return PairDecision(
+        left=decision.left,
+        right=decision.right,
+        similarity=decision.similarity,
+        decision=verdict,
+        # Advisory only: the user confirms grey pairs in the cluster review.
+        status="review",
+        source=SOURCE_LLM,
+        reason=f"LLM önerisi ({verdict}): {suggestion['reason']}",
+        grey=True,
+        llm_confidence=suggestion["confidence"],
+    )
+
+
+def _grey_user_prompt(decision: PairDecision) -> str:
+    """Serialize the two compared values only — never the whole record."""
+
+    document = {
+        "left": {"value": str(decision.left.value), "normalized": decision.left.normalized},
+        "right": {"value": str(decision.right.value), "normalized": decision.right.normalized},
+        "embedding_similarity": round(decision.similarity, 4),
+    }
+    return json.dumps(document, ensure_ascii=False)
+
+
+def _parse_suggestion(
+    response: str, thresholds: SimilarityThresholds
+) -> tuple[dict[str, Any] | None, str]:
+    """Parse a grey-zone answer without trusting its shape or its confidence."""
+
+    try:
+        document = json.loads(_strip_json_fence(response))
+    except (TypeError, json.JSONDecodeError):
+        return None, "LLM yanıtı geçerli JSON değil."
+    if not isinstance(document, dict):
+        return None, "LLM yanıtı bir JSON nesnesi değil."
+
+    same = document.get("same")
+    confidence = document.get("confidence")
+    reason = document.get("reason")
+    if not isinstance(same, bool):
+        return None, "LLM yanıtında 'same' alanı boolean değil."
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        return None, "LLM yanıtında 'confidence' sayı değil."
+    if not 0.0 <= float(confidence) <= 1.0:
+        return None, "LLM güven değeri 0-1 aralığında değil."
+    if not isinstance(reason, str) or not reason.strip():
+        return None, "LLM yanıtında gerekçe yok."
+    if float(confidence) < thresholds.llm_min_confidence:
+        return None, (
+            f"LLM güveni {float(confidence):.2f} < {thresholds.llm_min_confidence:.2f}."
+        )
+    return {"same": same, "confidence": float(confidence), "reason": reason.strip()}, ""
+
+
+def _strip_json_fence(response: str) -> str:
+    text = response.strip() if isinstance(response, str) else ""
+    if text.startswith("```") and text.endswith("```"):
+        return text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    return text
 
 
 def _validate_strategies(strategy: str | Sequence[str]) -> tuple[str, ...]:

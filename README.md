@@ -76,7 +76,14 @@ Proje uçtan uca çalışır: CSV/XLSX kaynaklarını profiller, incelemeye aç�
 `merge_report.xlsx` çıktısına dönüştürür. Dönüştürme yalnızca dikey
 (union/append) yapılır, TR/EN sayı ve tarih normalizasyonu uygulanır; satır
 kaybedilmez, provenance sütunları her zaman eklenir ve dönüşüm hataları sayılır.
-Entity resolution (ürün tekilleştirme) henüz kapsam dışıdır.
+
+Entity resolution (ürün tekilleştirme) çekirdeği `core.entity` içinde hazırdır:
+normalizasyon → blocking → embedding + iki eşik → yalnızca **gri bölge** için LLM
+önerisi. Yüksek eşiğin üstü ve düşük eşiğin altı LLM'siz karara bağlanır; arada
+kalan az sayıda çift LLM'e sorulur ve **her hâlde `review` kalır** — otomatik
+birleşme yoktur. Embedding sağlayıcısı `EMBEDDING_PROVIDER` ile ayrı seçilir;
+`ollama` seçilirse karşılaştırılan adlar makineden çıkmaz. Küme raporu ve küme
+bazlı onay (4c) ile CLI'ya bağlanması henüz yapılmadı.
 
 MVP yalnızca `.csv` ve `.xlsx` girdilerini destekler; canlı veritabanları ve SQL
 dump'ları kapsam dışıdır. Hedef yalnızca dikey birleştirmedir, yatay join değildir.

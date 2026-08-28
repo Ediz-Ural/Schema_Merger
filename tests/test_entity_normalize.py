@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import copy
 from decimal import Decimal
 import inspect
@@ -111,12 +110,24 @@ def test_unit_and_abbreviation_tables_are_configurable() -> None:
     assert normalize("6 adt", config=config) == "6 adt"
 
 
-def test_module_never_calls_an_llm() -> None:
-    tree = ast.parse(inspect.getsource(entity))
-    imported: list[str] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported.extend(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            imported.append(node.module or "")
-    assert not [name for name in imported if "llm" in name.lower()]
+def test_the_deterministic_layers_never_call_a_completion() -> None:
+    for function in (
+        normalize,
+        entity.make_blocks,
+        entity.candidate_pairs,
+        entity.pair_count,
+        entity.score_pairs,
+    ):
+        assert ".complete(" not in inspect.getsource(function)
+
+
+def test_only_the_grey_zone_layer_reaches_the_llm() -> None:
+    """The LLM entered the module in layer 4; it must stay confined to it."""
+
+    callers = sorted(
+        name
+        for name, member in inspect.getmembers(entity, inspect.isfunction)
+        if member.__module__ == entity.__name__ and ".complete(" in inspect.getsource(member)
+    )
+
+    assert callers == ["_ask_llm"]
