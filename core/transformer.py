@@ -1,9 +1,12 @@
 """Deterministic vertical transformation from a mapping plan to target rows.
 
-This module intentionally has no dependency on :mod:`core.llm`.  It reads each
+This module intentionally has no dependency on :mod:`core.llm`, not even an
+indirect one: entity resolution reaches it only as the approved ``clusters.yaml``
+document, which is read with :func:`core.contracts.canonical_map`.  It reads each
 source independently, converts values according to the target schema, and
 concatenates rows only vertically.  CSV input is processed in chunks so callers
-can tune memory use for large files.
+can tune memory use for large files.  :func:`deduplicate` then applies approved
+entity clusters to the result.
 """
 
 from __future__ import annotations
@@ -16,12 +19,28 @@ from typing import Iterable, Iterator, Sequence
 import pandas as pd
 import polars as pl
 
-from core.contracts import MappingContract, SchemaContract, load_mapping, load_schema
+from core.contracts import (
+    ClusterContract,
+    MappingContract,
+    SchemaContract,
+    canonical_map,
+    load_mapping,
+    load_schema,
+)
 from core.normalize import NormalizationError, TargetType, normalize_value
-from core.types import MappingEntry, SourceMatch, TargetColumn
+from core.types import EntityClusterPlan, MappingEntry, SourceMatch, TargetColumn
 
 
 DEFAULT_CHUNK_SIZE = 50_000
+
+#: Provenance column naming the approved cluster a merged row came from.
+ENTITY_CLUSTER_COLUMN = "_entity_cluster_id"
+
+#: Provenance column counting how many source rows a written row stands for.
+MERGED_ROW_COUNT_COLUMN = "_merged_row_count"
+
+#: Separator used when a deduplicated row carries several origin values.
+PROVENANCE_SEPARATOR = "; "
 
 
 class TransformError(ValueError):
@@ -115,6 +134,204 @@ def transform_files(
     """Named alias for :func:`transform` for application-layer callers."""
 
     return transform(mapping, source_files, target_schema, chunk_size=chunk_size)
+
+
+def original_value_column(target_column: str) -> str:
+    """Provenance column holding the pre-canonical value of ``target_column``."""
+
+    return f"{target_column}_original_value"
+
+
+@dataclass(frozen=True)
+class DeduplicationResult:
+    """The deduplicated transformation plus what entity resolution changed."""
+
+    result: TransformationResult
+    target_column: str
+    merged_cluster_count: int
+    canonicalized_row_count: int
+    duplicate_row_count: int
+
+
+def deduplicate(
+    result: TransformationResult,
+    clusters: ClusterContract | Sequence[EntityClusterPlan],
+    *,
+    column: str | None = None,
+) -> DeduplicationResult:
+    """Apply approved entity clusters to a transformed table.
+
+    Two deterministic steps, both driven by ``clusters.yaml`` alone — no LLM and
+    no similarity is recomputed here (spec §14).  First every member spelling of
+    an **approved** (``status: auto``) cluster is rewritten to that cluster's
+    canonical value.  Then rows that became identical across *all* target
+    columns collapse — but only when they came from **different spellings**, so
+    only the duplicates entity resolution itself created are removed.  Two rows
+    that were already identical (the same product sold twice at the same price)
+    stay two rows, and rows outside an approved cluster are never touched, so a
+    cluster left in ``review`` cannot silently lose rows.
+
+    Provenance survives the collapse: the surviving row keeps every origin value
+    of the rows it absorbed (joined with ``"; "``), names its cluster in
+    ``_entity_cluster_id``, keeps the original spellings in
+    ``<column>_original_value``, and counts the rows it stands for in
+    ``_merged_row_count``.
+    """
+
+    plans = list(clusters.clusters) if isinstance(clusters, ClusterContract) else list(clusters)
+    target = column or next((plan.target_column for plan in plans), None)
+    if not target:
+        raise TransformError(
+            "Entity tekilleştirme için hedef sütun gerekli: clusters.yaml boş, --column ver."
+        )
+    if target not in result.dataframe.columns:
+        raise TransformError(f"Entity sütunu '{target}' birleşik veride yok.")
+    if result.dataframe.schema[target] != pl.String:
+        raise TransformError(
+            f"Entity tekilleştirme yalnızca metin sütunlarında yapılır; '{target}' metin değil."
+        )
+    mismatched = {plan.target_column for plan in plans} - {target}
+    if mismatched:
+        raise TransformError(
+            f"clusters.yaml '{', '.join(sorted(mismatched))}' sütununu tanımlıyor, "
+            f"tekilleştirme ise '{target}' üzerinde isteniyor."
+        )
+
+    canonical = canonical_map(plans)
+    columns = list(result.dataframe.columns)
+    provenance_columns = list(result.provenance.columns)
+
+    survivors: dict[tuple[object, ...], list[int]] = {}
+    data_rows: list[dict[str, object | None]] = []
+    provenance_rows: list[dict[str, object]] = []
+    merged_clusters: set[str] = set()
+    canonicalized = 0
+    duplicates = 0
+
+    for data_row, provenance_row in zip(
+        result.dataframe.rows(named=True), result.provenance.rows(named=True)
+    ):
+        value = data_row[target]
+        entry = canonical.get(value) if isinstance(value, str) else None
+        if entry is None:
+            data_rows.append(dict(data_row))
+            provenance_rows.append(_entity_provenance(provenance_row, provenance_columns, None, None))
+            continue
+
+        canonical_value, cluster_id = entry
+        merged_clusters.add(cluster_id)
+        merged_row = dict(data_row)
+        merged_row[target] = canonical_value
+        if canonical_value != value:
+            canonicalized += 1
+
+        key = (cluster_id, *(merged_row[name] for name in columns))
+        group = survivors.setdefault(key, [])
+        position = _absorbing_row(group, provenance_rows, value)
+        if position is None:
+            group.append(len(data_rows))
+            data_rows.append(merged_row)
+            provenance_rows.append(
+                _entity_provenance(provenance_row, provenance_columns, cluster_id, value)
+            )
+            continue
+        _absorb_provenance(provenance_rows[position], provenance_row, provenance_columns, value)
+        duplicates += 1
+
+    deduplicated = TransformationResult(
+        dataframe=_rebuild_dataframe(data_rows, result.dataframe),
+        provenance=_entity_provenance_dataframe(provenance_rows, provenance_columns, target),
+        conversion_error_counts=dict(result.conversion_error_counts),
+    )
+    return DeduplicationResult(
+        result=deduplicated,
+        target_column=target,
+        merged_cluster_count=len(merged_clusters),
+        canonicalized_row_count=canonicalized,
+        duplicate_row_count=duplicates,
+    )
+
+
+def _absorbing_row(
+    group: Sequence[int], provenance_rows: Sequence[dict[str, object]], value: str
+) -> int | None:
+    """The row this duplicate folds into, or ``None`` when it stands on its own.
+
+    A row only folds into a row built from a *different* spelling.  Repeating
+    the same spelling twice is real repetition in the source data, not something
+    entity resolution unified, so both rows survive.
+    """
+
+    for position in group:
+        if value not in provenance_rows[position]["_originals"]:  # type: ignore[operator]
+            return position
+    return None
+
+
+def _entity_provenance(
+    provenance_row: dict[str, object],
+    columns: Sequence[str],
+    cluster_id: str | None,
+    original_value: str | None,
+) -> dict[str, object]:
+    """Start a provenance row; every origin field becomes an ordered value list."""
+
+    row: dict[str, object] = {
+        name: [provenance_row[name]] if provenance_row[name] is not None else []
+        for name in columns
+    }
+    row[ENTITY_CLUSTER_COLUMN] = cluster_id
+    row["_originals"] = [original_value] if original_value is not None else []
+    row[MERGED_ROW_COUNT_COLUMN] = 1
+    return row
+
+
+def _absorb_provenance(
+    survivor: dict[str, object],
+    provenance_row: dict[str, object],
+    columns: Sequence[str],
+    original_value: str | None,
+) -> None:
+    """Fold a duplicate row's origins into the row that survives it."""
+
+    for name in columns:
+        value = provenance_row[name]
+        if value is not None and value not in survivor[name]:
+            survivor[name].append(value)  # type: ignore[union-attr]
+    if original_value is not None and original_value not in survivor["_originals"]:
+        survivor["_originals"].append(original_value)  # type: ignore[union-attr]
+    survivor[MERGED_ROW_COUNT_COLUMN] = int(survivor[MERGED_ROW_COUNT_COLUMN]) + 1
+
+
+def _rebuild_dataframe(rows: list[dict[str, object | None]], template: pl.DataFrame) -> pl.DataFrame:
+    values = {name: [row.get(name) for row in rows] for name in template.columns}
+    return pl.DataFrame(values).cast(dict(template.schema), strict=False)
+
+
+def _entity_provenance_dataframe(
+    rows: list[dict[str, object]], columns: Sequence[str], target_column: str
+) -> pl.DataFrame:
+    original_column = original_value_column(target_column)
+    values: dict[str, list[object]] = {
+        name: [_join_provenance(row[name]) for row in rows] for name in columns
+    }
+    values[ENTITY_CLUSTER_COLUMN] = [row[ENTITY_CLUSTER_COLUMN] for row in rows]
+    values[original_column] = [_join_provenance(row["_originals"]) for row in rows]
+    values[MERGED_ROW_COUNT_COLUMN] = [row[MERGED_ROW_COUNT_COLUMN] for row in rows]
+    frame = pl.DataFrame(values)
+    text_columns = [*columns, ENTITY_CLUSTER_COLUMN, original_column]
+    return frame.cast(
+        {
+            **{name: pl.String for name in text_columns},
+            MERGED_ROW_COUNT_COLUMN: pl.Int64,
+        },
+        strict=False,
+    )
+
+
+def _join_provenance(values: object) -> str | None:
+    items = [str(value) for value in values] if isinstance(values, list) else []
+    return PROVENANCE_SEPARATOR.join(items) if items else None
 
 
 def _entries_for_schema(plan: MappingContract, schema: SchemaContract) -> dict[str, MappingEntry]:

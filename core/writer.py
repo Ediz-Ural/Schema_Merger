@@ -25,13 +25,19 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 import re
+from typing import Sequence
 
 import polars as pl
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
-from core.contracts import VALID_OUTPUT_FORMATS, MappingContract, SchemaContract
-from core.transformer import TransformationResult
+from core.contracts import VALID_OUTPUT_FORMATS, ClusterContract, MappingContract, SchemaContract
+from core.transformer import (
+    MERGED_ROW_COUNT_COLUMN,
+    DeduplicationResult,
+    TransformationResult,
+)
+from core.types import EntityClusterPlan
 
 
 #: Name of the provenance column carrying the originating source file per row.
@@ -43,6 +49,43 @@ DEFAULT_REPORT_NAME = "merge_report.xlsx"
 
 class WriteError(ValueError):
     """Raised for an unsupported format or an inconsistent transformation."""
+
+
+@dataclass(frozen=True)
+class EntitySummary:
+    """What entity resolution did to this merge, for the report (spec §5).
+
+    ``clusters`` is the whole reviewed document, approved and pending alike: the
+    report has to show the uncertain ones as well, because those products were
+    deliberately *not* merged.
+    """
+
+    target_column: str
+    clusters: tuple[EntityClusterPlan, ...] = ()
+    merged_cluster_count: int = 0
+    canonicalized_row_count: int = 0
+    duplicate_row_count: int = 0
+
+    @classmethod
+    def from_deduplication(
+        cls,
+        dedup: DeduplicationResult,
+        clusters: ClusterContract | Sequence[EntityClusterPlan],
+    ) -> "EntitySummary":
+        plans = clusters.clusters if isinstance(clusters, ClusterContract) else list(clusters)
+        return cls(
+            target_column=dedup.target_column,
+            clusters=tuple(plans),
+            merged_cluster_count=dedup.merged_cluster_count,
+            canonicalized_row_count=dedup.canonicalized_row_count,
+            duplicate_row_count=dedup.duplicate_row_count,
+        )
+
+    @property
+    def pending_clusters(self) -> list[EntityClusterPlan]:
+        """Clusters no one approved; their members stayed separate."""
+
+        return [cluster for cluster in self.clusters if cluster.status == "review"]
 
 
 @dataclass(frozen=True)
@@ -73,11 +116,14 @@ def write(
     report_path: str | Path | None = None,
     table_name: str | None = None,
     add_provenance: bool = True,
+    entity: EntitySummary | None = None,
 ) -> WriteResult:
     """Write ``merged.<fmt>`` and ``merge_report.xlsx`` for one merge run.
 
     ``add_provenance`` only records the caller's intent: provenance columns are
-    written regardless, matching the project invariant.
+    written regardless, matching the project invariant.  ``entity`` carries the
+    approved-cluster outcome when entity resolution ran, so the report can show
+    what merged and what stayed uncertain.
     """
 
     merged = Path(out_path)
@@ -85,7 +131,7 @@ def write(
 
     merged_path = write_merged(result, schema, merged, output_format=fmt, table_name=table_name)
     report = Path(report_path) if report_path is not None else merged.parent / DEFAULT_REPORT_NAME
-    report_out = write_merge_report(result, mapping, schema, report, output_format=fmt)
+    report_out = write_merge_report(result, mapping, schema, report, output_format=fmt, entity=entity)
 
     return WriteResult(
         merged_path=merged_path,
@@ -131,15 +177,16 @@ def write_merge_report(
     report_path: str | Path,
     *,
     output_format: str | None = None,
+    entity: EntitySummary | None = None,
 ) -> Path:
     """Write ``merge_report.xlsx`` describing matches, row counts and nulls."""
 
     destination = Path(report_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
-    _fill_summary_sheet(workbook, result, schema, output_format)
+    _fill_summary_sheet(workbook, result, schema, output_format, entity)
     _fill_columns_sheet(workbook, result, mapping, schema)
-    _fill_entity_sheet(workbook)
+    _fill_entity_sheet(workbook, entity)
     workbook.save(destination)
     return destination
 
@@ -199,6 +246,7 @@ def _fill_summary_sheet(
     result: TransformationResult,
     schema: SchemaContract,
     output_format: str | None,
+    entity: EntitySummary | None = None,
 ) -> None:
     sheet = workbook.active
     sheet.title = "Summary"
@@ -211,6 +259,17 @@ def _fill_summary_sheet(
         ("output_format", output_format or schema.output.format),
         ("provenance_added", True),
     ]
+    if entity is not None:
+        rows.extend(
+            [
+                ("entity_column", entity.target_column),
+                ("entity_clusters", len(entity.clusters)),
+                ("entity_clusters_merged", entity.merged_cluster_count),
+                ("entity_pending_clusters", len(entity.pending_clusters)),
+                ("entity_canonicalized_rows", entity.canonicalized_row_count),
+                ("entity_duplicate_rows_removed", entity.duplicate_row_count),
+            ]
+        )
     for metric, value in rows:
         sheet.append([metric, value])
     _autosize(sheet)
@@ -269,15 +328,83 @@ def _fill_columns_sheet(
     _autosize(sheet)
 
 
-def _fill_entity_sheet(workbook: Workbook) -> None:
-    """Reserve a sheet for Phase 4 entity resolution results (spec §12)."""
+def _fill_entity_sheet(workbook: Workbook, entity: EntitySummary | None = None) -> None:
+    """Report entity clusters: what merged, and what stayed uncertain (spec §5).
+
+    Pending clusters are written too, and marked plainly: those products were
+    *not* deduplicated because nobody approved them.
+    """
 
     sheet = workbook.create_sheet("Entity")
-    sheet.append(["target_column", "cluster_id", "representative", "member_count", "status", "note"])
     sheet.append(
-        [None, None, None, None, "reserved", "Reserved for Phase 4 entity resolution; populated when clustering runs."]
+        [
+            "target_column",
+            "cluster_id",
+            "representative",
+            "member_count",
+            "row_count",
+            "status",
+            "members",
+            "candidates",
+            "note",
+        ]
     )
+    if entity is None:
+        sheet.append(
+            [
+                None,
+                None,
+                None,
+                None,
+                None,
+                "not_run",
+                None,
+                None,
+                "Entity resolution bu çalıştırmada koşmadı; --clusters ile bağlanır.",
+            ]
+        )
+        _autosize(sheet)
+        return
+    if not entity.clusters:
+        sheet.append(
+            [
+                entity.target_column,
+                None,
+                None,
+                None,
+                None,
+                "empty",
+                None,
+                None,
+                "Küme dosyası boş; hiçbir değer birleştirilmedi.",
+            ]
+        )
+        _autosize(sheet)
+        return
+
+    for cluster in entity.clusters:
+        sheet.append(
+            [
+                cluster.target_column or entity.target_column,
+                cluster.cluster_id,
+                cluster.canonical,
+                len(cluster.members),
+                sum(member.row_count for member in cluster.members),
+                cluster.status,
+                "; ".join(member.value for member in cluster.members),
+                "; ".join(candidate.value for candidate in cluster.candidates),
+                _entity_note(cluster),
+            ]
+        )
     _autosize(sheet)
+
+
+def _entity_note(cluster: EntityClusterPlan) -> str:
+    if cluster.status == "review":
+        return "BELİRSİZ: onaylanmadı, üyeler birleştirilmedi. " + (cluster.reason or "")
+    if cluster.status == "rejected":
+        return "Kullanıcı reddetti: farklı ürünler. " + (cluster.reason or "")
+    return cluster.reason or "Onaylı küme; canonical değere getirildi."
 
 
 def _autosize(sheet) -> None:
@@ -327,7 +454,8 @@ def _build_sql_script(
 
 def _column_sql_types(frame: pl.DataFrame, schema: SchemaContract) -> dict[str, str]:
     types = {column.name: _SQL_TYPES[column.type] for column in schema.target_columns}
-    # Provenance columns are always text.
+    # Provenance columns are text, except the merged-row counter.
+    types.setdefault(MERGED_ROW_COUNT_COLUMN, "INTEGER")
     for name in frame.columns:
         types.setdefault(name, "TEXT")
     return types

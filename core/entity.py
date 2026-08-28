@@ -1,9 +1,10 @@
-"""Entity resolution: normalization, blocking, embedding, and the grey zone.
+"""Entity resolution: normalization, blocking, embedding, grey zone, clusters.
 
-Entity resolution (spec §4, §7) has four layers, cheapest first, and this
-module implements all of them.  Layers 1-3 are decided by code alone; the LLM
-is reached only in layer 4, for the pairs that sit between the two thresholds
-(spec §14).
+Entity resolution (spec §4, §7) has four decision layers, cheapest first, and
+this module implements all of them plus the clustering step that turns their
+verdicts into something a human can approve.  Layers 1-3 are decided by code
+alone; the LLM is reached only in layer 4, for the pairs that sit between the
+two thresholds (spec §14).
 
 Layer 1 — :func:`normalize` produces a comparison key for a value:
 Turkish-aware lowercasing, diacritic folding, number canonicalisation, unit
@@ -28,6 +29,13 @@ grey pair keeps ``status="review"`` whatever the answer, so it reaches a human
 in the cluster approval step and never merges on its own.  A malformed,
 low-confidence, or failed answer leaves the pair ``"undecided"`` — it is never
 quietly read as "same".
+
+Clustering — :func:`cluster` joins the pairs code settled as "same" into
+connected components and hangs every unresolved pair off them as a *candidate*.
+A component with no doubt attached is ``auto`` and merges; anything touched by
+an uncertain pair is ``review`` and merges only after the user approves it in
+``clusters.yaml`` (:func:`to_cluster_plans`, then
+:func:`core.contracts.canonical_map` on the reviewed file).
 
 Documented defaults
 -------------------
@@ -57,6 +65,7 @@ import re
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from core.llm import EmbeddingClient, LLMClient
+from core.types import ClusterCandidate, ClusterMember, EntityClusterPlan
 
 
 class EntityError(ValueError):
@@ -474,6 +483,270 @@ def pending_review(decisions: Iterable[PairDecision]) -> list[PairDecision]:
     """Pairs a human still has to confirm; ``apply`` must not merge these."""
 
     return [decision for decision in decisions if decision.status == "review"]
+
+
+# --------------------------------------------------------------------------- #
+# Layer 5 — clusters and cluster-level approval (spec §7)
+# --------------------------------------------------------------------------- #
+
+
+#: A cluster whose every internal link was settled by code; ``apply`` merges it.
+CLUSTER_STATUS_AUTO = "auto"
+
+#: A cluster holding at least one uncertain link; it waits for a human.
+CLUSTER_STATUS_REVIEW = "review"
+
+#: Field read from a record for its merged-row weight when picking a canonical.
+DEFAULT_WEIGHT_FIELD = "row_count"
+
+
+@dataclass(frozen=True)
+class ClusterCandidateLink:
+    """An uncertain pair that reaches *outside* a cluster.
+
+    ``record`` is the outside spelling being proposed and ``decision`` is the
+    pair it came from, so the report can show the similarity and who suggested
+    it.  A candidate is never a member: nothing merges before approval.
+    """
+
+    record: BlockedRecord
+    decision: PairDecision
+
+
+@dataclass(frozen=True)
+class EntityCluster:
+    """A group of spellings believed to be one real-world entity.
+
+    Members are connected by ``auto``/``same`` links only, so an ``auto``
+    cluster is one code alone is sure about.  Anything uncertain — a candidate
+    reaching outside the cluster, or a grey link between two members — turns the
+    status to ``review``, and a ``review`` cluster is never merged until the
+    user approves it.
+    """
+
+    cluster_id: str
+    members: tuple[BlockedRecord, ...]
+    canonical: BlockedRecord
+    status: str
+    reason: str
+    candidates: tuple[ClusterCandidateLink, ...] = ()
+
+    @property
+    def values(self) -> tuple[str, ...]:
+        return tuple(_value_text(member) for member in self.members)
+
+    @property
+    def canonical_value(self) -> str:
+        return _value_text(self.canonical)
+
+    @property
+    def block_key(self) -> str:
+        return self.members[0].block_key
+
+
+@dataclass(frozen=True)
+class ClusterResult:
+    """Every cluster worth showing the user, plus the column they describe."""
+
+    clusters: tuple[EntityCluster, ...]
+    target_column: str = ""
+    weight_field: str = DEFAULT_WEIGHT_FIELD
+
+    @property
+    def auto_clusters(self) -> list[EntityCluster]:
+        return [item for item in self.clusters if item.status == CLUSTER_STATUS_AUTO]
+
+    @property
+    def review_clusters(self) -> list[EntityCluster]:
+        return [item for item in self.clusters if item.status == CLUSTER_STATUS_REVIEW]
+
+
+def cluster(
+    decisions: Iterable[PairDecision],
+    *,
+    target_column: str = "",
+    weight_field: str = DEFAULT_WEIGHT_FIELD,
+    id_prefix: str = "c",
+) -> ClusterResult:
+    """Turn pair decisions into connected components a human can approve.
+
+    Only pairs that code settled as the same product (``decision="same"`` with
+    ``status="auto"``) join records together, so an uncertain pair can never
+    merge two spellings on its own.  Every pair still in ``review`` is recorded
+    as a *candidate* on the cluster it touches, which marks that cluster
+    ``review``: the user decides, and until then nothing in it is merged.
+
+    Singletons are dropped — a spelling matching nothing needs no decision — so
+    the result holds only clusters with at least two members or one candidate.
+    The canonical spelling is picked deterministically: most merged rows first,
+    then the shortest value, then alphabetical order.
+    """
+
+    records: dict[int, BlockedRecord] = {}
+    same_edges: list[tuple[int, int]] = []
+    uncertain: list[PairDecision] = []
+    for decision in decisions:
+        for side in (decision.left, decision.right):
+            records.setdefault(side.index, side)
+        if decision.decision == DECISION_SAME and decision.status == "auto":
+            same_edges.append((decision.left.index, decision.right.index))
+        elif decision.status == "review":
+            uncertain.append(decision)
+
+    parents = {index: index for index in records}
+    for left, right in same_edges:
+        _union(parents, left, right)
+
+    components: dict[int, list[int]] = {}
+    for index in records:
+        components.setdefault(_find(parents, index), []).append(index)
+
+    # Keyed by (cluster root, outside spelling): one spelling linked to a cluster
+    # by several of its members is a single decision for the user, not three.
+    candidates: dict[tuple[int, str], ClusterCandidateLink] = {}
+    internal: dict[int, int] = {}
+    for decision in uncertain:
+        left_root = _find(parents, decision.left.index)
+        right_root = _find(parents, decision.right.index)
+        if left_root == right_root:
+            # Both spellings are already members; the doubt is about the cluster
+            # itself, so it still needs a human even without a new candidate.
+            internal[left_root] = internal.get(left_root, 0) + 1
+            continue
+        # Record the link once, on the cluster that comes first in the report.
+        owner, outside = (
+            (left_root, decision.right)
+            if min(components[left_root]) <= min(components[right_root])
+            else (right_root, decision.left)
+        )
+        text = _value_text(outside)
+        if not text:
+            continue
+        known = candidates.get((owner, text))
+        if known is None or decision.similarity > known.decision.similarity:
+            candidates[(owner, text)] = ClusterCandidateLink(record=outside, decision=decision)
+
+    ordered_roots = sorted(components, key=lambda root: min(components[root]))
+    clusters: list[EntityCluster] = []
+    for root in ordered_roots:
+        members = tuple(records[index] for index in sorted(components[root]))
+        links = tuple(
+            sorted(
+                (link for (owner, _), link in candidates.items() if owner == root),
+                key=lambda link: (-link.decision.similarity, _value_text(link.record)),
+            )
+        )
+        if len(members) < 2 and not links:
+            continue
+        status = (
+            CLUSTER_STATUS_AUTO
+            if not links and not internal.get(root)
+            else CLUSTER_STATUS_REVIEW
+        )
+        clusters.append(
+            EntityCluster(
+                cluster_id=f"{id_prefix}{len(clusters) + 1:03d}",
+                members=members,
+                canonical=_canonical_member(members, weight_field),
+                status=status,
+                reason=_cluster_reason(len(members), len(links), internal.get(root, 0), status),
+                candidates=links,
+            )
+        )
+    return ClusterResult(
+        clusters=tuple(clusters), target_column=target_column, weight_field=weight_field
+    )
+
+
+def to_cluster_plans(result: ClusterResult) -> list[EntityClusterPlan]:
+    """Render clusters as the reviewable ``clusters.yaml`` documents."""
+
+    return [
+        EntityClusterPlan(
+            cluster_id=item.cluster_id,
+            target_column=result.target_column,
+            canonical=item.canonical_value,
+            status=item.status,
+            members=[
+                ClusterMember(
+                    value=_value_text(member),
+                    normalized=member.normalized,
+                    row_count=_record_weight(member.record, result.weight_field),
+                )
+                for member in item.members
+            ],
+            candidates=[
+                ClusterCandidate(
+                    value=_value_text(link.record),
+                    similarity=round(link.decision.similarity, 6),
+                    suggestion=link.decision.decision,
+                    source=link.decision.source,
+                    confidence=link.decision.llm_confidence,
+                    reason=link.decision.reason,
+                )
+                for link in item.candidates
+            ],
+            reason=item.reason,
+        )
+        for item in result.clusters
+    ]
+
+
+def _cluster_reason(member_count: int, candidate_count: int, internal_count: int, status: str) -> str:
+    if status == CLUSTER_STATUS_AUTO:
+        return f"{member_count} yazım eşik üstü benzerlikle otomatik birleşti."
+    parts = [f"{member_count} yazım kümede"]
+    if candidate_count:
+        parts.append(f"{candidate_count} belirsiz aday onay bekliyor")
+    if internal_count:
+        parts.append(f"{internal_count} belirsiz bağ var")
+    return "; ".join(parts) + ". Onaylanmadan birleştirilmez."
+
+
+def _canonical_member(members: Sequence[BlockedRecord], weight_field: str) -> BlockedRecord:
+    """Most frequent spelling, then the shortest, then alphabetical."""
+
+    return min(
+        members,
+        key=lambda member: (
+            -_record_weight(member.record, weight_field),
+            len(_value_text(member)),
+            _value_text(member),
+        ),
+    )
+
+
+def _value_text(record: BlockedRecord) -> str:
+    return "" if record.value is None else str(record.value)
+
+
+def _record_weight(record: object, field_name: str) -> int:
+    """Merged-row count for a record, ``0`` when the record does not carry one."""
+
+    if isinstance(record, Mapping):
+        value = record.get(field_name, 0)
+    else:
+        value = getattr(record, field_name, 0)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(0, value)
+
+
+def _find(parents: dict[int, int], index: int) -> int:
+    root = index
+    while parents[root] != root:
+        root = parents[root]
+    while parents[index] != root:  # path compression keeps repeated lookups flat
+        parents[index], index = root, parents[index]
+    return root
+
+
+def _union(parents: dict[int, int], left: int, right: int) -> None:
+    left_root, right_root = _find(parents, left), _find(parents, right)
+    if left_root != right_root:
+        # Lower index wins so cluster order does not depend on pair order.
+        low, high = sorted((left_root, right_root))
+        parents[high] = low
 
 
 def _classify(

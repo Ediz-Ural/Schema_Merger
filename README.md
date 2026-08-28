@@ -1,10 +1,9 @@
 # Schema Merger
 
-Schema Merger, farklı CSV ve Excel tablolarındaki heterojen sütunları daha sonraki
-aşamalarda kullanıcı onaylı bir planla tek bir **dikey (union/append)** çıktıda
-birleştirecek açık kaynaklı, self-hosted bir Python aracıdır. Bu ilk sürüm yalnızca
-dosyaları güvenli ve deterministik olarak profiller; birleştirme ya da LLM çağrısı
-yapmaz.
+Schema Merger, farklı CSV ve Excel tablolarındaki heterojen sütunları kullanıcı
+onaylı bir planla tek bir **dikey (union/append)** çıktıda birleştiren açık
+kaynaklı, self-hosted bir Python aracıdır. LLM yalnızca plan üreten `analyze` ve
+küme öneren `cluster` adımlarında kullanılır; `apply` tümüyle deterministiktir.
 
 Profiler her tablo için orijinal sütun adlarını, algılanan türleri, örnek değerleri,
 benzersiz değer sayısını, boş oranını, uygun olduğunda min/max değerlerini ve biçim
@@ -63,11 +62,52 @@ varsayılan olarak `mapping.yaml` klasöründeki `schema.yaml`'dır; kaynak dosy
 plandaki dosya adlarından aynı klasörde aranır. Farklı yerlerdeyse `--target-schema`
 ve `--inputs` ile yol verin.
 
+## Entity resolution: `cluster` → küme onayı → `apply --clusters`
+
+Aynı ürünün farklı yazımlarını (`Coca Cola 330ml`, `Coca-Cola 33cl`,
+`coca cola 0,33 lt`) tek ürüne indirmek isteğe bağlı bir adımdır ve onaylı bir
+`mapping.yaml` gerektirir:
+
+```bash
+# Faz 1b: kümeleri öner — embedding + yalnızca gri bölge için LLM
+python -m cli.main cluster --mapping mapping.yaml \
+                           --column product_name \
+                           --out clusters.yaml
+
+# (kullanıcı clusters.yaml'ı düzenler: status auto/rejected, aday taşıma, bölme)
+
+# Faz 2: uygula — LLM yok
+python -m cli.main apply --mapping mapping.yaml --clusters clusters.yaml \
+                         --out merged.xlsx --format xlsx
+```
+
+`cluster` yalnızca sütunun **farklı değerlerini** karşılaştırır (satır verisi
+sağlayıcıya gitmez) ve `clusters.yaml` yazar; hiçbir şeyi birleştirmez. Dosyadaki
+kurallar başlıkta yazılıdır:
+
+- `status: auto` — küme onaylı; `apply` üyeleri canonical değere getirir.
+- `status: review` — onaysız; **hiçbir üye birleştirilmez**, `merge_report`
+  içindeki `Entity` sayfasında "belirsiz" olarak listelenir.
+- `status: rejected` — kullanıcı farklı ürün dedi; birleştirilmez, belirsiz de
+  sayılmaz.
+
+Bir kümede belirsiz aday varsa küme `review` doğar: yüksek güvenli bağlar bile
+onay beklemeden birleşmez. `apply` bu yüzden küme onayı için durmaz — onaysız
+kümeler sadece uygulanmaz ve raporda görünür.
+
+Tekilleştirme yalnızca **entity çözümünün kendi yarattığı** yinelenmeleri siler:
+canonical değere getirildikten sonra tüm hedef sütunlarda aynılaşan ve farklı
+yazımlardan gelen satırlar tek satıra iner. Aynı yazımın gerçekten iki kez geçtiği
+satırlar (aynı ürünün iki ayrı satışı) korunur. Provenance bozulmaz: hayatta kalan
+satır `_entity_cluster_id`, `<sütun>_original_value` ve `_merged_row_count`
+sütunlarıyla birlikte birleştirdiği satırların tüm kaynak dosya/sütunlarını taşır.
+
 ## Gizlilik ve API anahtarları
 
 Kendi API anahtarınızı `.env` dosyanıza girin; anahtarlar **bize gitmez** ve hiçbir
 zaman kaynak koda yazılmaz. `.env` dosyası `.gitignore` içinde ilk satırda
-korunur. Bu aşama API anahtarı veya LLM kullanmaz.
+korunur. `profile` ve `apply` komutları API anahtarı istemez; anahtar yalnızca
+`analyze` ve `cluster` için gerekir.
 
 ## Mevcut kapsam
 
@@ -77,13 +117,13 @@ Proje uçtan uca çalışır: CSV/XLSX kaynaklarını profiller, incelemeye aç�
 (union/append) yapılır, TR/EN sayı ve tarih normalizasyonu uygulanır; satır
 kaybedilmez, provenance sütunları her zaman eklenir ve dönüşüm hataları sayılır.
 
-Entity resolution (ürün tekilleştirme) çekirdeği `core.entity` içinde hazırdır:
-normalizasyon → blocking → embedding + iki eşik → yalnızca **gri bölge** için LLM
-önerisi. Yüksek eşiğin üstü ve düşük eşiğin altı LLM'siz karara bağlanır; arada
-kalan az sayıda çift LLM'e sorulur ve **her hâlde `review` kalır** — otomatik
-birleşme yoktur. Embedding sağlayıcısı `EMBEDDING_PROVIDER` ile ayrı seçilir;
-`ollama` seçilirse karşılaştırılan adlar makineden çıkmaz. Küme raporu ve küme
-bazlı onay (4c) ile CLI'ya bağlanması henüz yapılmadı.
+Entity resolution (ürün tekilleştirme) uçtan uca bağlıdır: normalizasyon →
+blocking → embedding + iki eşik → yalnızca **gri bölge** için LLM önerisi →
+küme raporu → küme bazlı onay → tekilleştirme. Yüksek eşiğin üstü ve düşük eşiğin
+altı LLM'siz karara bağlanır; arada kalan az sayıda çift LLM'e sorulur ve **her
+hâlde `review` kalır** — otomatik birleşme yoktur. Embedding sağlayıcısı
+`EMBEDDING_PROVIDER` ile ayrı seçilir; `ollama` seçilirse karşılaştırılan adlar
+makineden çıkmaz.
 
 MVP yalnızca `.csv` ve `.xlsx` girdilerini destekler; canlı veritabanları ve SQL
 dump'ları kapsam dışıdır. Hedef yalnızca dikey birleştirmedir, yatay join değildir.

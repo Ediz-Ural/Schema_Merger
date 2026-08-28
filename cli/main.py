@@ -16,16 +16,36 @@ from core.contracts import (
     VALID_OUTPUT_FORMATS,
     ContractValidationError,
     MappingContract,
+    dump_clusters,
     dump_mapping,
+    load_clusters,
     load_mapping,
     load_schema,
 )
-from core.llm import LLMClient, LLMConfigurationError, create_llm_client
+from core.entity import (
+    BLOCKING_STRATEGIES,
+    DEFAULT_HIGH_THRESHOLD,
+    DEFAULT_LOW_THRESHOLD,
+    EntityError,
+    SimilarityThresholds,
+    grey_pairs,
+    make_blocks,
+    resolve_pairs,
+    to_cluster_plans,
+)
+from core.entity import cluster as build_clusters
+from core.llm import (
+    EmbeddingClient,
+    LLMClient,
+    LLMConfigurationError,
+    create_embedding_client,
+    create_llm_client,
+)
 from core.matcher import match_profiles
 from core.profiler import ProfileError, profile_file
-from core.transformer import TransformError, transform
+from core.transformer import TransformError, deduplicate, transform
 from core.types import SourceMatch
-from core.writer import DEFAULT_REPORT_NAME, WriteError, write
+from core.writer import DEFAULT_REPORT_NAME, EntitySummary, WriteError, write
 
 
 #: Exit code used when the review-guard stops a blind merge (spec §5).
@@ -53,6 +73,49 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--target-schema", required=True, type=Path, help="Path to target schema.yaml")
     analyze.add_argument("--out", required=True, type=Path, help="Destination mapping.yaml path")
 
+    cluster = subcommands.add_parser(
+        "cluster",
+        help="Propose entity clusters for one column of an approved plan (uses an LLM)",
+    )
+    cluster.add_argument("--mapping", required=True, type=Path, help="Path to the approved mapping.yaml")
+    cluster.add_argument("--column", required=True, help="Target column to resolve entities for")
+    cluster.add_argument("--out", required=True, type=Path, help="Destination clusters.yaml path")
+    cluster.add_argument(
+        "--target-schema",
+        type=Path,
+        help=f"Target schema.yaml; defaults to {DEFAULT_SCHEMA_NAME} next to the mapping",
+    )
+    cluster.add_argument(
+        "--inputs",
+        nargs="+",
+        type=Path,
+        help="Source files; defaults to the file names recorded in the mapping",
+    )
+    cluster.add_argument(
+        "--strategy",
+        nargs="+",
+        choices=list(BLOCKING_STRATEGIES),
+        default=["prefix"],
+        help="Blocking strategy or composite key (default: prefix)",
+    )
+    cluster.add_argument(
+        "--high",
+        type=float,
+        default=DEFAULT_HIGH_THRESHOLD,
+        help=f"Similarity at or above which a pair merges without an LLM (default {DEFAULT_HIGH_THRESHOLD})",
+    )
+    cluster.add_argument(
+        "--low",
+        type=float,
+        default=DEFAULT_LOW_THRESHOLD,
+        help=f"Similarity below which a pair is a different product (default {DEFAULT_LOW_THRESHOLD})",
+    )
+    cluster.add_argument(
+        "--no-llm",
+        action="store_true",
+        help="Skip the grey-zone LLM step; grey pairs stay undecided for the user",
+    )
+
     apply = subcommands.add_parser("apply", help="Apply an approved mapping plan without an LLM")
     apply.add_argument("--mapping", required=True, type=Path, help="Path to the approved mapping.yaml")
     apply.add_argument("--out", required=True, type=Path, help="Destination merged.<fmt> path")
@@ -78,14 +141,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=f"Report path; defaults to {DEFAULT_REPORT_NAME} next to --out",
     )
+    apply.add_argument(
+        "--clusters",
+        type=Path,
+        help="Approved clusters.yaml; only 'auto' clusters are deduplicated",
+    )
     return parser
 
 
-def main(argv: list[str] | None = None, *, llm_client: LLMClient | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    llm_client: LLMClient | None = None,
+    embedding_client: EmbeddingClient | None = None,
+) -> int:
     """Run a command.
 
-    ``llm_client`` is an injection point for tests. Normal CLI invocations
-    construct the configured client only for the ``analyze`` command.
+    ``llm_client`` and ``embedding_client`` are injection points for tests.
+    Normal CLI invocations construct the configured clients only for the
+    ``analyze`` and ``cluster`` commands.
     """
 
     args = build_parser().parse_args(argv)
@@ -114,6 +188,8 @@ def main(argv: list[str] | None = None, *, llm_client: LLMClient | None = None) 
         return 0
     if args.command == "analyze":
         return _analyze(args.inputs, args.target_schema, args.out, llm_client)
+    if args.command == "cluster":
+        return _cluster(args, llm_client, embedding_client)
     if args.command == "apply":
         # No LLM client is built here: Phase 2 is deterministic (spec §14).
         return _apply(
@@ -123,6 +199,7 @@ def main(argv: list[str] | None = None, *, llm_client: LLMClient | None = None) 
             args.target_schema,
             args.inputs,
             args.report,
+            args.clusters,
         )
     return 1
 
@@ -158,6 +235,84 @@ def _analyze(
     return 0
 
 
+def _cluster(args, llm_client: LLMClient | None, embedding_client: EmbeddingClient | None) -> int:
+    """Propose entity clusters for one target column of an approved plan.
+
+    This is still Phase 1 work — embeddings and, for the grey band only, an LLM
+    — so it writes a reviewable ``clusters.yaml`` and merges nothing.  Only the
+    distinct values of the chosen column are compared; whole rows never reach a
+    provider (spec §14).
+    """
+
+    _configure_utf8_stdout()
+    try:
+        mapping = load_mapping(args.mapping)
+    except ContractValidationError as error:
+        print(f"Error: {error}")
+        return 2
+
+    pending = _pending_reviews(mapping)
+    if pending:
+        _report_review_guard(pending, args.mapping, command="cluster")
+        return REVIEW_GUARD_EXIT_CODE
+
+    try:
+        thresholds = SimilarityThresholds(high=args.high, low=args.low)
+        schema = load_schema(_resolve_schema_path(args.target_schema, args.mapping))
+        sources = args.inputs if args.inputs else _resolve_source_files(mapping, args.mapping)
+        result = transform(mapping, sources, schema)
+        column = next((item for item in schema.target_columns if item.name == args.column), None)
+        if column is None:
+            names = ", ".join(item.name for item in schema.target_columns)
+            print(f"Error: '{args.column}' hedef şemada yok. Sütunlar: {names}")
+            return 2
+        if column.type != "string":
+            # apply would refuse to deduplicate it later; say so before the run.
+            print(f"Error: entity çözümü metin sütunlarında yapılır; '{args.column}' türü {column.type}.")
+            return 2
+        records = _value_records(result.dataframe[args.column].to_list())
+        blocks = make_blocks(records, strategy=args.strategy)
+        embedder = embedding_client or create_embedding_client()
+        llm = None if args.no_llm else (llm_client or create_llm_client())
+        decisions = resolve_pairs(blocks, embedder=embedder, llm=llm, thresholds=thresholds)
+        clusters = build_clusters(decisions, target_column=args.column)
+        plans = to_cluster_plans(clusters)
+        dump_clusters(plans, args.out)
+    except (ContractValidationError, EntityError, TransformError, LLMConfigurationError) as error:
+        print(f"Error: {error}")
+        return 2
+    except OSError as error:
+        print(f"Error: küme dosyası yazılamadı '{args.out}': {error}")
+        return 2
+
+    auto = len(clusters.auto_clusters)
+    review = len(clusters.review_clusters)
+    print(f"✓ {auto} küme yüksek güvenle birleşmeye hazır (status: auto)")
+    print(f"⚠ {review} küme onay bekliyor (status: review)")
+    print(f"• {len(records)} farklı değer, {len(decisions)} aday çift, {len(grey_pairs(decisions))} gri çift")
+    print(f"→ Kümeleri düzenle: {args.out}, sonra: merger apply --clusters {args.out}")
+    return 0
+
+
+def _value_records(values: list[object]) -> list[dict[str, object]]:
+    """Distinct non-empty values of a column with how many rows carry each.
+
+    Entity resolution compares spellings, not rows, so the same value repeated a
+    thousand times is embedded once.  The count rides along because the most
+    frequent spelling becomes the cluster's canonical value.
+    """
+
+    counts: dict[str, int] = {}
+    for value in values:
+        if value is None:
+            continue
+        text = str(value)
+        if not text.strip():
+            continue
+        counts[text] = counts.get(text, 0) + 1
+    return [{"name": text, "row_count": count} for text, count in counts.items()]
+
+
 def _apply(
     mapping_path: Path,
     output: Path,
@@ -165,6 +320,7 @@ def _apply(
     target_schema: Path | None,
     inputs: list[Path] | None,
     report: Path | None,
+    clusters_path: Path | None = None,
 ) -> int:
     """Apply an approved plan deterministically; stop while any match is review."""
 
@@ -180,11 +336,21 @@ def _apply(
         _report_review_guard(pending, mapping_path)
         return REVIEW_GUARD_EXIT_CODE
 
+    entity: EntitySummary | None = None
     try:
         schema_path = _resolve_schema_path(target_schema, mapping_path)
         schema = load_schema(schema_path)
         sources = inputs if inputs else _resolve_source_files(mapping, mapping_path)
         result = transform(mapping, sources, schema)
+        if clusters_path is not None:
+            contract = load_clusters(clusters_path)
+            if contract.clusters:
+                dedup = deduplicate(result, contract)
+                result = dedup.result
+                entity = EntitySummary.from_deduplication(dedup, contract)
+            else:
+                # Nothing to decide on: report the empty run instead of failing.
+                entity = EntitySummary(target_column="")
         written = write(
             result,
             mapping,
@@ -194,6 +360,7 @@ def _apply(
             report_path=report,
             table_name=output.stem,
             add_provenance=schema.output.add_provenance,
+            entity=entity,
         )
     except (ContractValidationError, TransformError, WriteError) as error:
         print(f"Error: {error}")
@@ -207,6 +374,16 @@ def _apply(
         f"• {written.null_cell_count} boş hücre (null), "
         f"{written.conversion_error_count} dönüştürme hatası"
     )
+    if entity is not None:
+        print(
+            f"• entity: {entity.merged_cluster_count} onaylı küme uygulandı, "
+            f"{entity.duplicate_row_count} yinelenen satır tekilleştirildi"
+        )
+        if entity.pending_clusters:
+            print(
+                f"⚠ {len(entity.pending_clusters)} küme onaysız kaldı; birleştirilmedi, "
+                "raporda 'belirsiz' olarak listelendi"
+            )
     print(f"→ Rapor: {written.report_path}")
     return 0
 
@@ -222,11 +399,13 @@ def _pending_reviews(mapping: MappingContract) -> list[tuple[str, SourceMatch]]:
     ]
 
 
-def _report_review_guard(pending: list[tuple[str, SourceMatch]], mapping_path: Path) -> None:
+def _report_review_guard(
+    pending: list[tuple[str, SourceMatch]], mapping_path: Path, *, command: str = "apply"
+) -> None:
     """Explain exactly which columns block the merge; write nothing (spec §5)."""
 
     print(
-        f"✗ apply durdu: {len(pending)} eşleştirme hâlâ onay bekliyor (review). "
+        f"✗ {command} durdu: {len(pending)} eşleştirme hâlâ onay bekliyor (review). "
         "Kör birleştirme yapılmaz."
     )
     for target_column, source in pending:
@@ -237,7 +416,7 @@ def _report_review_guard(pending: list[tuple[str, SourceMatch]], mapping_path: P
         print(line)
     print(
         f"→ {mapping_path} içindeki bu satırları düzenle "
-        "(status: auto veya unmatched), sonra tekrar: merger apply"
+        f"(status: auto veya unmatched), sonra tekrar: merger {command}"
     )
     print("Hiçbir çıktı dosyası yazılmadı.")
 
