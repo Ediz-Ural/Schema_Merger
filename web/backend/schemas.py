@@ -377,7 +377,7 @@ class ApplyResponse(BaseModel):
 
 
 class PendingMatch(BaseModel):
-    """One match that still blocks ``apply`` (spec section 5)."""
+    """One match that still blocks ``apply``."""
 
     target_column: str
     file: str
@@ -410,11 +410,12 @@ class SessionStatus(BaseModel):
 
 
 class ProviderInfo(BaseModel):
-    """Which provider is configured -- never the key itself."""
+    """Which provider this user configured -- never the key itself."""
 
     provider: str
     embedding_provider: str
     model: str
+    embedding_model: str = ""
     configured: bool
     detail: str | None = None
 
@@ -424,7 +425,7 @@ class SourceColumnModel(BaseModel):
 
     The review screen needs these to offer a dropdown: correcting a match is a
     choice among the columns that are really there, never a free-text guess
-    (spec section 7).
+    columns that really exist, never a free-text guess.
     """
 
     name: str
@@ -479,3 +480,55 @@ class ColumnsModel(BaseModel):
 
     files: list[FileColumnsModel] = Field(default_factory=list)
     target_columns: list[TargetColumnModel] = Field(default_factory=list)
+
+
+class RegisterRequest(BaseModel):
+    """Sign-up body; the password is never stored or echoed in clear."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    """Sign-in body."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str
+    password: str
+
+
+class UserModel(BaseModel):
+    """The account as a browser may see it -- never a key, never a hash."""
+
+    id: int
+    email: str
+    provider: str
+    model: str
+    embedding_model: str = ""
+    key_configured: bool = False
+
+
+class SessionToken(BaseModel):
+    """What a successful sign-in returns; send it as ``Authorization: Bearer``."""
+
+    token: str
+    user: UserModel
+
+
+class ProviderUpdate(BaseModel):
+    """The user's own provider settings.
+
+    ``api_key`` is held in server memory for this process only: it is never
+    written to disk and never comes back in a response.  Omit it to keep the
+    key already held, send an empty string to forget it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: Literal["openai", "anthropic", "ollama"]
+    model: str | None = None
+    embedding_model: str | None = None
+    api_key: str | None = None

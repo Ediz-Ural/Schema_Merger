@@ -17,8 +17,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from core.llm import FakeEmbeddingClient, FakeLLMClient
+from web.backend.auth import UserStore
 from web.backend.main import create_app
 from web.backend.routes import SessionStore, get_embedding_client, get_llm_client
+
+
+ACCOUNT = {"email": "kullanici@example.com", "password": "parola1234"}
 
 
 SCHEMA_YAML = """target_columns:
@@ -98,12 +102,29 @@ def embedder() -> FakeEmbeddingClient:
     return FakeEmbeddingClient(vectors=VECTORS, default=(0.0, 0.0, 1.0))
 
 
+def _app(tmp_path: Path) -> "object":
+    return create_app(
+        sessions=SessionStore(tmp_path / "sessions"), users=UserStore(tmp_path / "users.db")
+    )
+
+
+def _sign_up(test_client: TestClient, account: dict[str, str] | None = None) -> str:
+    """Register an account and return its bearer token."""
+
+    response = test_client.post("/auth/register", json=account or ACCOUNT)
+    assert response.status_code == 201, response.text
+    return response.json()["token"]
+
+
 @pytest.fixture
 def client(tmp_path: Path, llm: FakeLLMClient, embedder: FakeEmbeddingClient) -> TestClient:
-    app = create_app(sessions=SessionStore(tmp_path / "sessions"))
+    """A signed-in client; the provider itself is faked through the overrides."""
+
+    app = _app(tmp_path)
     app.dependency_overrides[get_llm_client] = lambda: llm
     app.dependency_overrides[get_embedding_client] = lambda: embedder
     with TestClient(app) as test_client:
+        test_client.headers["Authorization"] = f"Bearer {_sign_up(test_client)}"
         yield test_client
 
 
@@ -376,17 +397,55 @@ def test_deleting_a_session_removes_its_workspace(client: TestClient, tmp_path: 
     assert client.get(f"/status/{session_id}").status_code == 404
 
 
-def test_provider_endpoint_never_returns_the_key(client: TestClient, monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-do-not-leak")
+def test_a_users_own_key_is_accepted_but_never_returned(client: TestClient):
+    """The key is held in memory for this process only; no route echoes it."""
 
-    response = client.get("/provider")
+    response = client.put(
+        "/provider",
+        json={"provider": "openai", "model": "gpt-5-nano", "api_key": "sk-test-do-not-leak"},
+    )
 
     assert response.status_code == 200
     body = response.json()
-    assert body["provider"] == "openai"
-    assert body["configured"] is True
+    assert (body["provider"], body["model"], body["configured"]) == ("openai", "gpt-5-nano", True)
     assert "sk-test-do-not-leak" not in response.text
+    for path in ("/provider", "/auth/me"):
+        assert "sk-test-do-not-leak" not in client.get(path).text
+    assert client.get("/auth/me").json()["key_configured"] is True
+
+
+def test_a_key_is_never_written_to_disk(client: TestClient, tmp_path: Path):
+    """Neither the accounts database nor a workspace may contain the key."""
+
+    client.put("/provider", json={"provider": "openai", "api_key": "sk-secret-value"})
+    _upload(client)
+
+    written = [
+        path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    ]
+    assert not any(b"sk-secret-value" in blob for blob in written)
+
+
+def test_forgetting_the_key_leaves_the_model_choice_alone(client: TestClient):
+    client.put("/provider", json={"provider": "openai", "model": "gpt-4o-mini", "api_key": "sk-x"})
+
+    body = client.delete("/provider").json()
+
+    assert body["configured"] is False
+    assert body["model"] == "gpt-4o-mini"
+
+
+def test_signing_out_forgets_the_key_and_the_token(client: TestClient, tmp_path: Path):
+    client.put("/provider", json={"provider": "openai", "api_key": "sk-x"})
+
+    assert client.post("/auth/logout").status_code == 204
+    assert client.get("/auth/me").status_code == 401
+
+    token = client.post("/auth/login", json=ACCOUNT).json()["token"]
+    client.headers["Authorization"] = f"Bearer {token}"
+    assert client.get("/provider").json()["configured"] is False
 
 
 def test_a_refused_provider_call_is_reported_as_an_upstream_failure(client: TestClient):
@@ -410,17 +469,122 @@ def test_a_refused_provider_call_is_reported_as_an_upstream_failure(client: Test
     assert client.get(f"/status/{session_id}").json()["has_mapping"] is False
 
 
-def test_analyze_without_a_configured_key_fails_clearly(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "openai")
-    monkeypatch.setenv("OPENAI_API_KEY", "")  # also blocks .env from filling it in
-    app = create_app(sessions=SessionStore(tmp_path / "sessions"))
-    with TestClient(app) as configured_client:
-        session_id = _upload(configured_client)
+def test_analyze_without_a_key_tells_the_user_to_add_one(tmp_path: Path):
+    """No key, no Phase 1: the message says where to fix it, nothing is written."""
 
-        response = configured_client.post(f"/analyze/{session_id}", json={})
+    app = _app(tmp_path)
+    with TestClient(app) as fresh_client:
+        fresh_client.headers["Authorization"] = f"Bearer {_sign_up(fresh_client)}"
+        session_id = _upload(fresh_client)
+
+        response = fresh_client.post(f"/analyze/{session_id}", json={})
 
         assert response.status_code == 503
         body = response.json()
         assert body["error"] == "llm_not_configured"
-        assert "OPENAI_API_KEY" in body["message"]
-        assert configured_client.get("/provider").json()["configured"] is False
+        assert "API anahtarını" in body["message"]
+        assert fresh_client.get("/provider").json()["configured"] is False
+        assert fresh_client.get(f"/status/{session_id}").json()["has_mapping"] is False
+
+
+def test_every_session_route_requires_a_signed_in_user(client: TestClient, tmp_path: Path):
+    session_id = _upload(client)
+    anonymous = TestClient(client.app)
+
+    for method, path in [
+        ("get", f"/mapping/{session_id}"),
+        ("get", f"/columns/{session_id}"),
+        ("get", f"/status/{session_id}"),
+        ("post", f"/analyze/{session_id}"),
+        ("post", f"/apply/{session_id}"),
+        ("get", f"/download/{session_id}/merged"),
+        ("get", "/provider"),
+    ]:
+        response = getattr(anonymous, method)(path)
+        assert response.status_code == 401, f"{method} {path} korumasız"
+
+
+def test_one_user_cannot_reach_another_users_session(client: TestClient):
+    """Someone else's session is reported as missing, not as forbidden."""
+
+    session_id = _upload(client)
+    other = TestClient(client.app)
+    other.headers["Authorization"] = (
+        f"Bearer {_sign_up(other, {'email': 'baska@example.com', 'password': 'parola1234'})}"
+    )
+
+    for path in (f"/mapping/{session_id}", f"/status/{session_id}", f"/download/{session_id}/merged"):
+        assert other.get(path).status_code == 404
+
+
+def test_registration_refuses_a_taken_address_and_a_weak_password(client: TestClient):
+    assert client.post("/auth/register", json=ACCOUNT).status_code == 400
+    weak = {"email": "yeni@example.com", "password": "kisa"}
+    response = client.post("/auth/register", json=weak)
+    assert response.status_code == 400
+    assert "8 karakter" in response.json()["detail"]
+
+
+def test_a_wrong_password_is_refused_without_saying_which_half_was_wrong(client: TestClient):
+    unknown = client.post("/auth/login", json={"email": "yok@example.com", "password": "parola1234"})
+    wrong = client.post("/auth/login", json={"email": ACCOUNT["email"], "password": "yanlisparola"})
+
+    assert unknown.status_code == wrong.status_code == 401
+    assert unknown.json()["detail"] == wrong.json()["detail"]
+
+
+def test_the_stored_password_is_never_the_password_itself(tmp_path: Path):
+    """A leaked database must not hand anyone a usable password."""
+
+    store = UserStore(tmp_path / "users.db")
+    store.register("gizli@example.com", "cokgizliparola")
+
+    blob = (tmp_path / "users.db").read_bytes()
+    assert b"cokgizliparola" not in blob
+
+
+def test_starting_with_several_workers_stops_instead_of_failing_silently(monkeypatch):
+    """Keys live in one process's memory, so many workers would answer wrongly."""
+
+    from web.backend.main import MULTIPROCESS_OVERRIDE_ENV
+
+    monkeypatch.setattr("sys.argv", ["uvicorn", "web.backend.main:app", "--workers", "4"])
+    monkeypatch.delenv(MULTIPROCESS_OVERRIDE_ENV, raising=False)
+
+    with pytest.raises(RuntimeError) as refusal:
+        create_app()
+
+    message = str(refusal.value)
+    assert "tek süreçte çalışır" in message
+    assert "--workers 1" in message
+
+
+@pytest.mark.parametrize(
+    "argv, environment",
+    [
+        (["uvicorn", "web.backend.main:app", "--workers=8"], {}),
+        (["uvicorn", "web.backend.main:app"], {"WEB_CONCURRENCY": "3"}),
+        (["gunicorn", "-w", "2", "web.backend.main:app"], {}),
+    ],
+)
+def test_the_worker_count_is_read_from_the_command_line_and_the_environment(
+    monkeypatch, argv: list[str], environment: dict[str, str]
+):
+    from web.backend.main import MULTIPROCESS_OVERRIDE_ENV
+
+    monkeypatch.setattr("sys.argv", argv)
+    monkeypatch.delenv(MULTIPROCESS_OVERRIDE_ENV, raising=False)
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError):
+        create_app()
+
+
+def test_an_operator_who_knows_what_they_are_doing_can_override_the_refusal(monkeypatch):
+    from web.backend.main import MULTIPROCESS_OVERRIDE_ENV
+
+    monkeypatch.setattr("sys.argv", ["uvicorn", "web.backend.main:app", "--workers", "4"])
+    monkeypatch.setenv(MULTIPROCESS_OVERRIDE_ENV, "1")
+
+    assert create_app() is not None

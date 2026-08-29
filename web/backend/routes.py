@@ -4,7 +4,7 @@ Every route is orchestration only: it loads a session's files, calls the same
 ``core`` functions the CLI calls, and shapes the result for a browser.  The
 invariants live in the core and are enforced here as HTTP status codes -- most
 importantly the review guard, which turns an unreviewed plan into ``409`` so no
-blind merge can be started from a UI either (spec section 5/14).
+blind merge can be started from a UI either.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import uuid
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from core.contracts import (
@@ -55,6 +55,14 @@ from core.transformer import TransformError, deduplicate, transform
 from core.validator import ValidationError, ValidationSettings, validate
 from core.writer import DEFAULT_REPORT_NAME, EntitySummary, WriteError, write
 
+from .auth import (
+    DEFAULT_EMBEDDING_MODELS,
+    DEFAULT_MODELS,
+    AuthError,
+    ProviderCredentials,
+    User,
+    UserStore,
+)
 from .schemas import (
     AnalyzeRequest,
     ColumnsModel,
@@ -64,16 +72,21 @@ from .schemas import (
     ClustersModel,
     ClustersUpdate,
     FileColumnsModel,
+    LoginRequest,
     FindingModel,
     MappingModel,
     MappingUpdate,
     PendingMatch,
     ProviderInfo,
+    ProviderUpdate,
+    RegisterRequest,
     ReviewGuardDetail,
     SessionStatus,
+    SessionToken,
     StatusCounts,
     TargetColumnModel,
     UploadResponse,
+    UserModel,
 )
 
 
@@ -101,6 +114,7 @@ class Session:
 
     session_id: str
     workspace: Path
+    user_id: int
     inputs: list[str] = field(default_factory=list)
     schema_file: str = SCHEMA_NAME
     state: str = "uploaded"
@@ -143,17 +157,23 @@ class SessionStore:
     def root(self) -> Path:
         return self._root
 
-    def create(self) -> Session:
+    def create(self, user: User) -> Session:
         session_id = uuid.uuid4().hex
         workspace = self._root / session_id
         workspace.mkdir(parents=True, exist_ok=False)
-        session = Session(session_id=session_id, workspace=workspace)
+        session = Session(session_id=session_id, workspace=workspace, user_id=user.id)
         self._sessions[session_id] = session
         return session
 
-    def get(self, session_id: str) -> Session:
+    def get(self, session_id: str, user: User) -> Session:
+        """One user's own session.
+
+        Someone else's session is reported as missing rather than forbidden, so
+        the API never confirms that an id exists to a user who may not see it.
+        """
+
         session = self._sessions.get(session_id)
-        if session is None:
+        if session is None or session.user_id != user.id:
             raise HTTPException(status_code=404, detail=f"Oturum bulunamadı: {session_id}")
         return session
 
@@ -169,21 +189,64 @@ def get_sessions(request: Request) -> SessionStore:
     return request.app.state.sessions
 
 
-def get_llm_client() -> LLMClient:
-    """Build the configured chat client.
+def get_users(request: Request) -> UserStore:
+    """The account store the app was built with."""
 
-    The key is read from the environment inside ``core.llm`` and never travels
-    through a request or a response; tests override this dependency with a fake
-    so no provider is contacted (spec section 14).
+    return request.app.state.users
+
+
+def current_user(
+    authorization: str | None = Header(default=None),
+    users: UserStore = Depends(get_users),
+) -> User:
+    """The signed-in account behind ``Authorization: Bearer <token>``."""
+
+    token = ""
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    user = users.user_for_token(token) if token else None
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Giriş gerekli ya da oturumun süresi doldu.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+
+
+def get_credentials(
+    user: User = Depends(current_user), users: UserStore = Depends(get_users)
+) -> ProviderCredentials:
+    """This user's own provider settings, key included from memory."""
+
+    return users.credentials(user)
+
+
+def get_llm_client(credentials: ProviderCredentials = Depends(get_credentials)) -> LLMClient:
+    """Build the chat client from the *user's own* key and model.
+
+    The key lives only in this process's memory (see :mod:`web.backend.auth`);
+    it never travels back in a response and is never written to disk.  Tests
+    override this dependency with a fake so no provider is contacted.
     """
 
-    return create_llm_client()
+    if not credentials.configured:
+        raise LLMConfigurationError(
+            "Sağlayıcı anahtarın tanımlı değil. Ayarlar ekranından kendi API anahtarını gir."
+        )
+    return create_llm_client(credentials.to_config())
 
 
-def get_embedding_client() -> EmbeddingClient:
-    """Build the configured embedding client (same key rules as above)."""
+def get_embedding_client(
+    credentials: ProviderCredentials = Depends(get_credentials),
+) -> EmbeddingClient:
+    """Build the embedding client from the user's own settings."""
 
-    return create_embedding_client()
+    if not credentials.configured:
+        raise LLMConfigurationError(
+            "Sağlayıcı anahtarın tanımlı değil. Ayarlar ekranından kendi API anahtarını gir."
+        )
+    return create_embedding_client(credentials.to_config())
 
 
 @router.get("/health")
@@ -191,32 +254,97 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@router.get("/provider", response_model=ProviderInfo)
-def provider() -> ProviderInfo:
-    """Report which provider is configured -- never the key, not even masked."""
+@router.post("/auth/register", response_model=SessionToken, status_code=201)
+def register(payload: RegisterRequest, users: UserStore = Depends(get_users)) -> SessionToken:
+    """Create an account and sign it in straight away."""
 
-    config = LLMConfig.from_environment()
-    models = {
-        "openai": config.openai_model,
-        "anthropic": config.anthropic_model,
-        "ollama": config.ollama_model,
-    }
     try:
-        create_llm_client(config)
-    except LLMConfigurationError as error:
-        return ProviderInfo(
-            provider=config.provider,
-            embedding_provider=config.embedding_provider or config.provider,
-            model=models.get(config.provider, ""),
-            configured=False,
-            detail=str(error),
-        )
+        user = users.register(payload.email, payload.password)
+    except AuthError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return SessionToken(token=users.issue_token(user), user=_user_model(user, users))
+
+
+@router.post("/auth/login", response_model=SessionToken)
+def login(payload: LoginRequest, users: UserStore = Depends(get_users)) -> SessionToken:
+    """Sign in; a wrong password and an unknown address answer the same way."""
+
+    try:
+        user = users.authenticate(payload.email, payload.password)
+    except AuthError as error:
+        raise HTTPException(status_code=401, detail=str(error)) from error
+    return SessionToken(token=users.issue_token(user), user=_user_model(user, users))
+
+
+@router.post("/auth/logout", status_code=204)
+def logout(
+    authorization: str | None = Header(default=None),
+    users: UserStore = Depends(get_users),
+    user: User = Depends(current_user),
+) -> None:
+    """Sign out: the token is dropped and the in-memory key with it."""
+
+    if authorization and authorization.lower().startswith("bearer "):
+        users.revoke(authorization.split(" ", 1)[1].strip())
+
+
+@router.get("/auth/me", response_model=UserModel)
+def me(user: User = Depends(current_user), users: UserStore = Depends(get_users)) -> UserModel:
+    """Who is signed in, and whether their key is currently held."""
+
+    return _user_model(user, users)
+
+
+@router.get("/provider", response_model=ProviderInfo)
+def provider(credentials: ProviderCredentials = Depends(get_credentials)) -> ProviderInfo:
+    """Report this user's provider and model -- never the key, not even masked."""
+
+    detail = None if credentials.configured else "API anahtarı girilmedi."
     return ProviderInfo(
-        provider=config.provider,
-        embedding_provider=config.embedding_provider or config.provider,
-        model=models.get(config.provider, ""),
-        configured=True,
+        provider=credentials.provider,
+        embedding_provider=credentials.provider,
+        model=credentials.model or DEFAULT_MODELS.get(credentials.provider, ""),
+        embedding_model=credentials.embedding_model
+        or DEFAULT_EMBEDDING_MODELS.get(credentials.provider, ""),
+        configured=credentials.configured,
+        detail=detail,
     )
+
+
+@router.put("/provider", response_model=ProviderInfo)
+def set_provider(
+    payload: ProviderUpdate,
+    user: User = Depends(current_user),
+    users: UserStore = Depends(get_users),
+) -> ProviderInfo:
+    """Store this user's provider and model, and hold their key in memory.
+
+    The provider and model are persisted (they are not secret).  The key is
+    kept in this process only: it is not written to the database, not written
+    to a session workspace, and never returned by any endpoint.
+    """
+
+    try:
+        updated = users.set_provider(
+            user,
+            provider=payload.provider,
+            model=payload.model,
+            embedding_model=payload.embedding_model,
+            api_key=payload.api_key,
+        )
+    except AuthError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return provider(users.credentials(updated))
+
+
+@router.delete("/provider", response_model=ProviderInfo)
+def forget_key(
+    user: User = Depends(current_user), users: UserStore = Depends(get_users)
+) -> ProviderInfo:
+    """Forget the key held for this user without touching their model choice."""
+
+    users.clear_key(user)
+    return provider(users.credentials(user))
 
 
 @router.post("/upload", response_model=UploadResponse, status_code=201)
@@ -224,10 +352,11 @@ async def upload(
     files: list[UploadFile] = File(..., description="One or more .csv or .xlsx sources"),
     target_schema: UploadFile = File(..., description="Target schema.yaml"),
     sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> UploadResponse:
     """Create a workspace from the uploaded sources and the target schema."""
 
-    session = sessions.create()
+    session = sessions.create(user)
     try:
         for upload_file in files:
             name = _safe_name(upload_file.filename, "girdi dosyası")
@@ -264,10 +393,11 @@ def analyze(
     payload: AnalyzeRequest = Body(default_factory=AnalyzeRequest),
     sessions: SessionStore = Depends(get_sessions),
     llm: LLMClient = Depends(get_llm_client),
+    user: User = Depends(current_user),
 ) -> MappingModel:
     """Phase 1: profile the sources and propose a plan; merge nothing."""
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     schema = _load_schema(session)
     try:
         profiles = [
@@ -289,6 +419,7 @@ def columns(
     session_id: str,
     sheet: str | None = None,
     sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> ColumnsModel:
     """The columns a reviewer may pick from, per uploaded file.
 
@@ -297,7 +428,7 @@ def columns(
     No LLM runs here and nothing is written.
     """
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     schema = _load_schema(session)
     try:
         profiles = [
@@ -312,10 +443,14 @@ def columns(
 
 
 @router.get("/mapping/{session_id}", response_model=MappingModel)
-def get_mapping(session_id: str, sessions: SessionStore = Depends(get_sessions)) -> MappingModel:
+def get_mapping(
+    session_id: str,
+    sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
+) -> MappingModel:
     """The current plan, with the counts a review screen shows."""
 
-    return MappingModel.from_core(_load_mapping(sessions.get(session_id)))
+    return MappingModel.from_core(_load_mapping(sessions.get(session_id, user)))
 
 
 @router.put("/mapping/{session_id}", response_model=MappingModel)
@@ -323,10 +458,11 @@ def put_mapping(
     session_id: str,
     payload: MappingUpdate,
     sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> MappingModel:
     """Replace the plan with the user's decisions; the contract validates it."""
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     mapping = payload.to_core()
     try:
         dump_mapping(mapping, session.mapping_path)
@@ -346,6 +482,7 @@ def propose_clusters(
     sessions: SessionStore = Depends(get_sessions),
     llm: LLMClient = Depends(get_llm_client),
     embedder: EmbeddingClient = Depends(get_embedding_client),
+    user: User = Depends(current_user),
 ) -> ClustersModel:
     """Phase 1 entity proposal for one approved column; still merges nothing.
 
@@ -354,7 +491,7 @@ def propose_clusters(
     whole rows never reach a provider.
     """
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     schema = _load_schema(session)
     mapping = _load_mapping(session)
     _enforce_review_guard(mapping)
@@ -406,10 +543,14 @@ def propose_clusters(
 
 
 @router.get("/clusters/{session_id}", response_model=ClustersModel)
-def get_clusters(session_id: str, sessions: SessionStore = Depends(get_sessions)) -> ClustersModel:
+def get_clusters(
+    session_id: str,
+    sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
+) -> ClustersModel:
     """The proposed clusters awaiting approval."""
 
-    return ClustersModel.from_core(_load_clusters(sessions.get(session_id)))
+    return ClustersModel.from_core(_load_clusters(sessions.get(session_id, user)))
 
 
 @router.put("/clusters/{session_id}", response_model=ClustersModel)
@@ -417,10 +558,11 @@ def put_clusters(
     session_id: str,
     payload: ClustersUpdate,
     sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> ClustersModel:
     """Store the user's cluster decisions; only ``auto`` ones ever merge."""
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     contract = payload.to_core()
     try:
         dump_clusters(contract.clusters, session.clusters_path)
@@ -436,6 +578,7 @@ def apply(
     session_id: str,
     payload: ApplyRequest = Body(default_factory=ApplyRequest),
     sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> ApplyResponse:
     """Phase 2: deterministic merge.
 
@@ -444,7 +587,7 @@ def apply(
     and either one answers ``409`` with nothing written.
     """
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     schema = _load_schema(session)
     mapping = _load_mapping(session)
     _enforce_review_guard(mapping)
@@ -506,7 +649,10 @@ def apply(
 
 @router.get("/download/{session_id}/{artifact}")
 def download(
-    session_id: str, artifact: str, sessions: SessionStore = Depends(get_sessions)
+    session_id: str,
+    artifact: str,
+    sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
 ) -> FileResponse:
     """Serve ``merged.<fmt>`` or ``merge_report.xlsx`` of a finished run."""
 
@@ -514,7 +660,7 @@ def download(
         raise HTTPException(
             status_code=404, detail=f"Bilinmeyen çıktı: '{artifact}'. 'merged' ya da 'report'."
         )
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     path = session.artifact_path(artifact)
     if path is None:
         raise HTTPException(
@@ -524,10 +670,14 @@ def download(
 
 
 @router.get("/status/{session_id}", response_model=SessionStatus)
-def status(session_id: str, sessions: SessionStore = Depends(get_sessions)) -> SessionStatus:
+def status(
+    session_id: str,
+    sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
+) -> SessionStatus:
     """Where this session stands; enough progress for an MVP UI."""
 
-    session = sessions.get(session_id)
+    session = sessions.get(session_id, user)
     counts: StatusCounts | None = None
     if session.mapping_path.is_file():
         try:
@@ -548,15 +698,34 @@ def status(session_id: str, sessions: SessionStore = Depends(get_sessions)) -> S
 
 
 @router.delete("/session/{session_id}", status_code=204)
-def delete_session(session_id: str, sessions: SessionStore = Depends(get_sessions)) -> None:
+def delete_session(
+    session_id: str,
+    sessions: SessionStore = Depends(get_sessions),
+    user: User = Depends(current_user),
+) -> None:
     """Drop a workspace and its files once the user is done with it."""
 
-    sessions.get(session_id)
+    sessions.get(session_id, user)
     sessions.discard(session_id)
 
 
+def _user_model(user: User, users: UserStore) -> UserModel:
+    """The account for a browser: settings yes, key never."""
+
+    credentials = users.credentials(user)
+    return UserModel(
+        id=user.id,
+        email=user.email,
+        provider=credentials.provider,
+        model=credentials.model or DEFAULT_MODELS.get(credentials.provider, ""),
+        embedding_model=credentials.embedding_model
+        or DEFAULT_EMBEDDING_MODELS.get(credentials.provider, ""),
+        key_configured=credentials.configured,
+    )
+
+
 def _enforce_review_guard(mapping: MappingContract) -> None:
-    """Refuse with 409 while any match is still ``review`` (spec section 5)."""
+    """Refuse with 409 while any match is still ``review``."""
 
     pending = pending_reviews(mapping)
     if not pending:
