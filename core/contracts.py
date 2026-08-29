@@ -208,6 +208,22 @@ def canonical_map(
     return mapping
 
 
+def pending_reviews(mapping: MappingContract) -> list[tuple[str, SourceMatch]]:
+    """Every ``(target_column, source)`` still waiting for a human decision.
+
+    This is the review-guard predicate itself: the CLI and the web backend both
+    read it, so ``apply`` refuses a blind merge on exactly the same rule
+    (spec section 5/14).
+    """
+
+    return [
+        (entry.target_column, source)
+        for entry in mapping.entries
+        for source in entry.sources
+        if source.status == "review"
+    ]
+
+
 def pending_clusters(
     clusters: ClusterContract | Iterable[EntityClusterPlan],
 ) -> list[EntityClusterPlan]:

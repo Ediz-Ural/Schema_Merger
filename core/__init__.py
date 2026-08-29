@@ -5,7 +5,7 @@ shadow the :mod:`core.normalize` submodule on the package.  Import it as
 ``from core.entity import normalize``.
 """
 
-from .contracts import ClusterContract, canonical_map, pending_clusters
+from .contracts import ClusterContract, canonical_map, pending_clusters, pending_reviews
 from .entity import (
     UNBLOCKED_KEY,
     BlockedRecord,
@@ -70,6 +70,7 @@ __all__ = [
     "pair_count",
     "pending_clusters",
     "pending_review",
+    "pending_reviews",
     "resolve_pairs",
     "review_grey_zone",
     "score_pairs",

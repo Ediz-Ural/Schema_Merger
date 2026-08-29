@@ -5,7 +5,10 @@ indirect one: entity resolution reaches it only as the approved ``clusters.yaml`
 document, which is read with :func:`core.contracts.canonical_map`.  It reads each
 source independently, converts values according to the target schema, and
 concatenates rows only vertically.  CSV input is processed in chunks so callers
-can tune memory use for large files.  :func:`deduplicate` then applies approved
+can tune memory use for large files.  Every worksheet of a multi-sheet workbook
+is a source table: sheets carrying none of the mapped source columns are skipped
+instead of contributing empty rows, and ``sheet`` restricts a run to one named
+worksheet.  :func:`deduplicate` then applies approved
 entity clusters to the result.
 """
 
@@ -55,12 +58,15 @@ class TransformationResult:
     same row order and contains ``source_file`` plus one source-column field per
     target column.  A ``None`` provenance column denotes an unmatched target.
     Invalid values are represented by null in ``dataframe`` and counted in
-    ``conversion_error_counts``; no row is removed.
+    ``conversion_error_counts``; no row is removed.  ``skipped_sheets`` names the
+    worksheets that were read but contributed no rows because they carry none of
+    the mapped source columns.
     """
 
     dataframe: pl.DataFrame
     provenance: pl.DataFrame
     conversion_error_counts: dict[str, int]
+    skipped_sheets: tuple[str, ...] = ()
 
     @property
     def row_count(self) -> int:
@@ -77,6 +83,7 @@ def transform(
     target_schema: SchemaContract | str | Path,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    sheet: str | None = None,
 ) -> TransformationResult:
     """Apply an approved mapping to source files as a vertical union.
 
@@ -84,6 +91,12 @@ def transform(
     names rather than absolute paths.  Source matches are associated by file
     name, as emitted by the analyzer.  CSV files are read in ``chunk_size``
     records; Excel worksheets are yielded one at a time.
+
+    ``sheet`` restricts every ``.xlsx`` source to one named worksheet; CSV
+    sources ignore it, so a mixed run does not have to be split.  Without it all
+    worksheets are appended vertically, except the ones carrying none of the
+    columns mapped for that file: an address list next to a sales sheet adds no
+    empty rows, it is reported in ``skipped_sheets`` instead.
     """
 
     if chunk_size < 1:
@@ -98,17 +111,28 @@ def transform(
     data_rows: list[dict[str, object | None]] = []
     provenance_rows: list[dict[str, str | None]] = []
     failures = {column.name: 0 for column in schema.target_columns}
+    skipped_sheets: list[str] = []
 
     for path in paths:
         if not path.is_file():
             raise TransformError(f"Input file does not exist or is not a file: {path}")
         matches = _matches_for_file(entries, path)
+        mapped_columns = {
+            match.column
+            for match in matches.values()
+            if match is not None and match.column is not None
+        }
         saw_columns: set[str] = set()
-        for frame in _read_frames(path, chunk_size):
-            saw_columns.update(str(column) for column in frame.columns)
+        for label, frame in _read_frames(path, chunk_size, sheet):
+            frame_columns = {str(column) for column in frame.columns}
+            saw_columns.update(frame_columns)
+            if mapped_columns and not (mapped_columns & frame_columns):
+                # An unrelated worksheet: appending it would only add empty rows.
+                skipped_sheets.append(label)
+                continue
             _append_frame_rows(
                 frame,
-                path.name,
+                label,
                 schema.target_columns,
                 matches,
                 data_rows,
@@ -121,6 +145,7 @@ def transform(
         dataframe=_target_dataframe(data_rows, schema.target_columns),
         provenance=_provenance_dataframe(provenance_rows, schema.target_columns),
         conversion_error_counts=failures,
+        skipped_sheets=tuple(skipped_sheets),
     )
 
 
@@ -130,10 +155,11 @@ def transform_files(
     target_schema: SchemaContract | str | Path,
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
+    sheet: str | None = None,
 ) -> TransformationResult:
     """Named alias for :func:`transform` for application-layer callers."""
 
-    return transform(mapping, source_files, target_schema, chunk_size=chunk_size)
+    return transform(mapping, source_files, target_schema, chunk_size=chunk_size, sheet=sheet)
 
 
 def original_value_column(target_column: str) -> str:
@@ -242,6 +268,7 @@ def deduplicate(
         dataframe=_rebuild_dataframe(data_rows, result.dataframe),
         provenance=_entity_provenance_dataframe(provenance_rows, provenance_columns, target),
         conversion_error_counts=dict(result.conversion_error_counts),
+        skipped_sheets=result.skipped_sheets,
     )
     return DeduplicationResult(
         result=deduplicated,
@@ -369,10 +396,20 @@ def _same_file(mapped_file: str, path: Path) -> bool:
     return mapped_file == str(path) or Path(mapped_file).name == path.name
 
 
-def _read_frames(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
+def _read_frames(
+    path: Path, chunk_size: int, sheet: str | None = None
+) -> Iterator[tuple[str, pd.DataFrame]]:
+    """Yield ``(provenance_label, frame)`` for every table inside ``path``.
+
+    The label is the file name, qualified with ``#<worksheet>`` when a workbook
+    holds more than one, so a merged row keeps naming the sheet it came from.
+    """
+
     suffix = path.suffix.lower()
     if suffix == ".csv":
-        yield from _read_csv_chunks(path, chunk_size)
+        # ``sheet`` is an Excel notion; a mixed run keeps its CSV sources.
+        for frame in _read_csv_chunks(path, chunk_size):
+            yield path.name, frame
         return
     if suffix != ".xlsx":
         raise TransformError(f"Unsupported input format '{path.suffix or '<none>'}'. Only .csv and .xlsx are supported.")
@@ -380,7 +417,16 @@ def _read_frames(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
         sheets = pd.read_excel(path, sheet_name=None, dtype=object, engine="openpyxl")
     except Exception as error:  # pandas/openpyxl report various exceptions
         raise TransformError(f"Could not read Excel file '{path}': {error}") from error
-    yield from sheets.values()
+    if sheet is not None:
+        if sheet not in sheets:
+            available = ", ".join(str(name) for name in sheets) or "(yok)"
+            raise TransformError(
+                f"'{path.name}' içinde '{sheet}' sheet'i yok. Mevcut sheet'ler: {available}"
+            )
+        sheets = {sheet: sheets[sheet]}
+    qualified = len(sheets) > 1
+    for name, frame in sheets.items():
+        yield (f"{path.name}#{name}" if qualified else path.name), frame
 
 
 def _read_csv_chunks(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:

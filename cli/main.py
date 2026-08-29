@@ -21,6 +21,7 @@ from core.contracts import (
     load_clusters,
     load_mapping,
     load_schema,
+    pending_reviews as _pending_reviews,
 )
 from core.entity import (
     BLOCKING_STRATEGIES,
@@ -38,6 +39,7 @@ from core.llm import (
     EmbeddingClient,
     LLMClient,
     LLMConfigurationError,
+    LLMRequestError,
     create_embedding_client,
     create_llm_client,
 )
@@ -45,6 +47,13 @@ from core.matcher import match_profiles
 from core.profiler import ProfileError, profile_file
 from core.transformer import TransformError, deduplicate, transform
 from core.types import SourceMatch
+from core.validator import (
+    ValidationError,
+    ValidationReport,
+    ValidationSettings,
+    downgrade_to_review,
+    validate,
+)
 from core.writer import DEFAULT_REPORT_NAME, EntitySummary, WriteError, write
 
 
@@ -72,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     analyze.add_argument("--target-schema", required=True, type=Path, help="Path to target schema.yaml")
     analyze.add_argument("--out", required=True, type=Path, help="Destination mapping.yaml path")
+    analyze.add_argument("--sheet", help="Restrict every .xlsx source to one named worksheet; CSV sources ignore it")
 
     cluster = subcommands.add_parser(
         "cluster",
@@ -91,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Source files; defaults to the file names recorded in the mapping",
     )
+    cluster.add_argument("--sheet", help="Restrict every .xlsx source to one named worksheet; CSV sources ignore it")
     cluster.add_argument(
         "--strategy",
         nargs="+",
@@ -141,10 +152,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=f"Report path; defaults to {DEFAULT_REPORT_NAME} next to --out",
     )
+    apply.add_argument("--sheet", help="Restrict every .xlsx source to one named worksheet; CSV sources ignore it")
     apply.add_argument(
         "--clusters",
         type=Path,
         help="Approved clusters.yaml; only 'auto' clusters are deduplicated",
+    )
+    apply.add_argument(
+        "--null-threshold",
+        type=float,
+        default=ValidationSettings().null_warning_ratio,
+        help=(
+            "Null ratio above which a mapped column is flagged "
+            f"(default {ValidationSettings().null_warning_ratio})"
+        ),
     )
     return parser
 
@@ -187,7 +208,7 @@ def main(
                 print(f"  - {column.name}: " + ", ".join(details))
         return 0
     if args.command == "analyze":
-        return _analyze(args.inputs, args.target_schema, args.out, llm_client)
+        return _analyze(args.inputs, args.target_schema, args.out, llm_client, args.sheet)
     if args.command == "cluster":
         return _cluster(args, llm_client, embedding_client)
     if args.command == "apply":
@@ -200,22 +221,32 @@ def main(
             args.inputs,
             args.report,
             args.clusters,
+            args.null_threshold,
+            args.sheet,
         )
     return 1
 
 
 def _analyze(
-    inputs: list[Path], target_schema: Path, output: Path, llm_client: LLMClient | None
+    inputs: list[Path],
+    target_schema: Path,
+    output: Path,
+    llm_client: LLMClient | None,
+    sheet: str | None = None,
 ) -> int:
-    """Profile sources and write a reviewable mapping plan; never merge rows."""
+    """Profile sources and write a reviewable mapping plan; never merge rows.
+
+    ``sheet`` narrows the Excel sources to one worksheet, exactly like the same
+    flag on ``apply``; CSV sources are unaffected so a mixed run still works.
+    """
 
     try:
         schema = load_schema(target_schema)
-        profiles = [profile_file(input_path) for input_path in inputs]
+        profiles = [profile_file(input_path, sheet=_sheet_for(input_path, sheet)) for input_path in inputs]
         client = llm_client or create_llm_client()
         mapping = match_profiles(profiles, schema, client)
         dump_mapping(mapping, output)
-    except (ContractValidationError, ProfileError, LLMConfigurationError) as error:
+    except (ContractValidationError, ProfileError, LLMConfigurationError, LLMRequestError) as error:
         print(f"Error: {error}")
         return 2
     except OSError as error:
@@ -260,7 +291,7 @@ def _cluster(args, llm_client: LLMClient | None, embedding_client: EmbeddingClie
         thresholds = SimilarityThresholds(high=args.high, low=args.low)
         schema = load_schema(_resolve_schema_path(args.target_schema, args.mapping))
         sources = args.inputs if args.inputs else _resolve_source_files(mapping, args.mapping)
-        result = transform(mapping, sources, schema)
+        result = transform(mapping, sources, schema, sheet=args.sheet)
         column = next((item for item in schema.target_columns if item.name == args.column), None)
         if column is None:
             names = ", ".join(item.name for item in schema.target_columns)
@@ -278,7 +309,13 @@ def _cluster(args, llm_client: LLMClient | None, embedding_client: EmbeddingClie
         clusters = build_clusters(decisions, target_column=args.column)
         plans = to_cluster_plans(clusters)
         dump_clusters(plans, args.out)
-    except (ContractValidationError, EntityError, TransformError, LLMConfigurationError) as error:
+    except (
+        ContractValidationError,
+        EntityError,
+        TransformError,
+        LLMConfigurationError,
+        LLMRequestError,
+    ) as error:
         print(f"Error: {error}")
         return 2
     except OSError as error:
@@ -321,8 +358,16 @@ def _apply(
     inputs: list[Path] | None,
     report: Path | None,
     clusters_path: Path | None = None,
+    null_threshold: float | None = None,
+    sheet: str | None = None,
 ) -> int:
-    """Apply an approved plan deterministically; stop while any match is review."""
+    """Apply an approved plan deterministically; stop while any match is review.
+
+    Two guards run before anything is written: the Phase-1 review guard on the
+    plan itself, and the validator on the transformed data (spec §7).  A serious
+    validator finding pushes the mapping behind it back to ``review`` and stops
+    the merge exactly like an unreviewed match does.
+    """
 
     _configure_utf8_stdout()
     try:
@@ -341,7 +386,7 @@ def _apply(
         schema_path = _resolve_schema_path(target_schema, mapping_path)
         schema = load_schema(schema_path)
         sources = inputs if inputs else _resolve_source_files(mapping, mapping_path)
-        result = transform(mapping, sources, schema)
+        result = transform(mapping, sources, schema, sheet=sheet)
         if clusters_path is not None:
             contract = load_clusters(clusters_path)
             if contract.clusters:
@@ -351,6 +396,12 @@ def _apply(
             else:
                 # Nothing to decide on: report the empty run instead of failing.
                 entity = EntitySummary(target_column="")
+        settings = ValidationSettings() if null_threshold is None else ValidationSettings(null_warning_ratio=null_threshold)
+        validation = validate(result, mapping, schema, settings=settings)
+        if validation.blocking:
+            # Nothing is written: the data contradicts the approved plan.
+            _report_validation_guard(validation, mapping, mapping_path)
+            return REVIEW_GUARD_EXIT_CODE
         written = write(
             result,
             mapping,
@@ -361,8 +412,9 @@ def _apply(
             table_name=output.stem,
             add_provenance=schema.output.add_provenance,
             entity=entity,
+            validation=validation,
         )
-    except (ContractValidationError, TransformError, WriteError) as error:
+    except (ContractValidationError, TransformError, ValidationError, WriteError) as error:
         print(f"Error: {error}")
         return 2
     except OSError as error:
@@ -370,6 +422,11 @@ def _apply(
         return 2
 
     print(f"✓ {written.row_count} satır yazıldı: {written.merged_path}")
+    if result.skipped_sheets:
+        print(
+            f"• atlanan sheet: {', '.join(result.skipped_sheets)} "
+            "(eşlenen kaynak sütunlarından hiçbiri yok, boş satır eklenmedi)"
+        )
     print(
         f"• {written.null_cell_count} boş hücre (null), "
         f"{written.conversion_error_count} dönüştürme hatası"
@@ -384,19 +441,41 @@ def _apply(
                 f"⚠ {len(entity.pending_clusters)} küme onaysız kaldı; birleştirilmedi, "
                 "raporda 'belirsiz' olarak listelendi"
             )
+    if validation.warnings:
+        print(f"⚠ validator: {len(validation.warnings)} uyarı (veri değiştirilmedi):")
+        for finding in validation.warnings:
+            print(f"  - {finding.describe()}")
+    else:
+        print("• validator: tutarsızlık bulunamadı")
     print(f"→ Rapor: {written.report_path}")
     return 0
 
 
-def _pending_reviews(mapping: MappingContract) -> list[tuple[str, SourceMatch]]:
-    """Every ``(target_column, source)`` pair still waiting for a decision."""
+def _report_validation_guard(
+    validation: ValidationReport, mapping: MappingContract, mapping_path: Path
+) -> None:
+    """Explain the serious findings and which mapping lines they push to review."""
 
-    return [
-        (entry.target_column, source)
-        for entry in mapping.entries
-        for source in entry.sources
-        if source.status == "review"
-    ]
+    errors = validation.errors
+    print(
+        f"✗ apply durdu: validator {len(errors)} ciddi tutarsızlık buldu. "
+        "Kör birleştirme yapılmaz."
+    )
+    for finding in errors:
+        print(f"  - {finding.describe()}")
+
+    downgraded = downgrade_to_review(mapping, validation)
+    pending = _pending_reviews(downgraded)
+    if pending:
+        print("→ review'a düşen eşleştirmeler:")
+        for target_column, source in pending:
+            column = source.column if source.column is not None else "(sütun seçilmedi)"
+            print(f"  - {target_column} ← {source.file}:{column}")
+    print(
+        f"→ {mapping_path} içinde bu eşleştirmeleri düzelt (başka bir kaynak sütun seç ya da "
+        "unmatched yap); tür/zorunluluk beklentisi yanlışsa schema.yaml'ı güncelle."
+    )
+    print("Veri değiştirilmedi, hiçbir çıktı dosyası yazılmadı.")
 
 
 def _report_review_guard(
@@ -467,6 +546,12 @@ def _resolve_source_files(mapping: MappingContract, mapping_path: Path) -> list[
             + ". --inputs ile dosya yollarını ver."
         )
     return resolved
+
+
+def _sheet_for(path: Path, sheet: str | None) -> str | None:
+    """``--sheet`` applies to workbooks only, so a mixed run keeps its CSVs."""
+
+    return sheet if sheet is not None and path.suffix.lower() == ".xlsx" else None
 
 
 def _configure_utf8_stdout() -> None:

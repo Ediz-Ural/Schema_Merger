@@ -76,3 +76,46 @@ def test_fake_embedder_makes_no_network_call_and_records_the_batch():
 
     assert embedder.embed(["coca cola", "fanta"]) == [[1.0, 0.0], [0.0, 1.0]]
     assert embedder.calls == [["coca cola", "fanta"]]
+
+
+def test_a_provider_that_refuses_the_call_raises_a_clean_request_error():
+    """A reachable-but-refusing provider is a request failure, not a crash.
+
+    Nothing on the network is contacted: the port is closed on purpose, which
+    is the same transport failure an unreachable provider produces.
+    """
+
+    from core.llm import LLMRequestError, OllamaClient
+
+    client = OllamaClient(model="phi3", base_url="http://127.0.0.1:1", timeout=2.0)
+
+    with pytest.raises(LLMRequestError) as failure:
+        client.complete("system", "user")
+
+    message = str(failure.value)
+    assert message.startswith("Ollama isteği başarısız:")
+    assert "ağ bağlantısını kontrol et" in message.lower()
+
+
+def test_a_missing_model_is_explained_with_what_to_do():
+    from core.llm import LLMRequestError, _request_error
+
+    error = _request_error(
+        "OpenAI",
+        "text-embedding-3-small",
+        RuntimeError(
+            "Error code: 403 - {'error': {'message': 'Project `proj_x` does not have access "
+            "to model `text-embedding-3-small`', 'code': 'model_not_found'}}"
+        ),
+    )
+
+    assert isinstance(error, LLMRequestError)
+    assert "'text-embedding-3-small' modeline erişim yok" in str(error)
+
+
+def test_an_invalid_key_is_named_without_echoing_the_key():
+    from core.llm import _request_error
+
+    error = _request_error("OpenAI", "gpt-5-nano", RuntimeError("Incorrect API key provided: sk-***"))
+
+    assert "Anahtar geçersiz görünüyor" in str(error)

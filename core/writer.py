@@ -38,6 +38,7 @@ from core.transformer import (
     TransformationResult,
 )
 from core.types import EntityClusterPlan
+from core.validator import ValidationReport
 
 
 #: Name of the provenance column carrying the originating source file per row.
@@ -117,13 +118,16 @@ def write(
     table_name: str | None = None,
     add_provenance: bool = True,
     entity: EntitySummary | None = None,
+    validation: ValidationReport | None = None,
 ) -> WriteResult:
     """Write ``merged.<fmt>`` and ``merge_report.xlsx`` for one merge run.
 
     ``add_provenance`` only records the caller's intent: provenance columns are
     written regardless, matching the project invariant.  ``entity`` carries the
     approved-cluster outcome when entity resolution ran, so the report can show
-    what merged and what stayed uncertain.
+    what merged and what stayed uncertain.  ``validation`` carries the
+    validator's findings; blocking ones never reach this function, because
+    ``apply`` stops before writing anything.
     """
 
     merged = Path(out_path)
@@ -131,7 +135,9 @@ def write(
 
     merged_path = write_merged(result, schema, merged, output_format=fmt, table_name=table_name)
     report = Path(report_path) if report_path is not None else merged.parent / DEFAULT_REPORT_NAME
-    report_out = write_merge_report(result, mapping, schema, report, output_format=fmt, entity=entity)
+    report_out = write_merge_report(
+        result, mapping, schema, report, output_format=fmt, entity=entity, validation=validation
+    )
 
     return WriteResult(
         merged_path=merged_path,
@@ -178,15 +184,17 @@ def write_merge_report(
     *,
     output_format: str | None = None,
     entity: EntitySummary | None = None,
+    validation: ValidationReport | None = None,
 ) -> Path:
     """Write ``merge_report.xlsx`` describing matches, row counts and nulls."""
 
     destination = Path(report_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     workbook = Workbook()
-    _fill_summary_sheet(workbook, result, schema, output_format, entity)
-    _fill_columns_sheet(workbook, result, mapping, schema)
+    _fill_summary_sheet(workbook, result, schema, output_format, entity, validation)
+    _fill_columns_sheet(workbook, result, mapping, schema, validation)
     _fill_entity_sheet(workbook, entity)
+    _fill_validation_sheet(workbook, validation)
     workbook.save(destination)
     return destination
 
@@ -247,6 +255,7 @@ def _fill_summary_sheet(
     schema: SchemaContract,
     output_format: str | None,
     entity: EntitySummary | None = None,
+    validation: ValidationReport | None = None,
 ) -> None:
     sheet = workbook.active
     sheet.title = "Summary"
@@ -259,6 +268,9 @@ def _fill_summary_sheet(
         ("output_format", output_format or schema.output.format),
         ("provenance_added", True),
     ]
+    if result.skipped_sheets:
+        # Sheets read but not appended: they carry none of the mapped columns.
+        rows.append(("skipped_sheets", ", ".join(result.skipped_sheets)))
     if entity is not None:
         rows.extend(
             [
@@ -268,6 +280,14 @@ def _fill_summary_sheet(
                 ("entity_pending_clusters", len(entity.pending_clusters)),
                 ("entity_canonicalized_rows", entity.canonicalized_row_count),
                 ("entity_duplicate_rows_removed", entity.duplicate_row_count),
+            ]
+        )
+    if validation is not None:
+        rows.extend(
+            [
+                ("validation_errors", len(validation.errors)),
+                ("validation_warnings", len(validation.warnings)),
+                ("validation_findings", len(validation.findings)),
             ]
         )
     for metric, value in rows:
@@ -280,6 +300,7 @@ def _fill_columns_sheet(
     result: TransformationResult,
     mapping: MappingContract,
     schema: SchemaContract,
+    validation: ValidationReport | None = None,
 ) -> None:
     sheet = workbook.create_sheet("Columns")
     headers = [
@@ -294,6 +315,7 @@ def _fill_columns_sheet(
         "null_count",
         "null_ratio",
         "conversion_errors",
+        "validation",
     ]
     sheet.append(headers)
 
@@ -303,10 +325,11 @@ def _fill_columns_sheet(
         null_count = result.dataframe[column.name].null_count()
         null_ratio = round(null_count / row_count, 6) if row_count else 0.0
         errors = result.conversion_error_counts.get(column.name, 0)
+        verdict = _validation_verdict(validation, column.name)
         sources = entries[column.name].sources if column.name in entries else []
         if not sources:
             sheet.append(
-                [column.name, column.type, column.required, None, None, None, None, None, null_count, null_ratio, errors]
+                [column.name, column.type, column.required, None, None, None, None, None, null_count, null_ratio, errors, verdict]
             )
             continue
         for source in sources:
@@ -323,9 +346,25 @@ def _fill_columns_sheet(
                     null_count,
                     null_ratio,
                     errors,
+                    verdict,
                 ]
             )
     _autosize(sheet)
+
+
+def _validation_verdict(validation: ValidationReport | None, target_column: str) -> str | None:
+    """Short per-column verdict; the Validation sheet carries the detail."""
+
+    if validation is None:
+        return None
+    findings = validation.for_column(target_column)
+    if not findings:
+        return "ok"
+    counts = {
+        severity: sum(1 for finding in findings if finding.severity == severity)
+        for severity in ("error", "warning", "info")
+    }
+    return ", ".join(f"{count} {severity}" for severity, count in counts.items() if count)
 
 
 def _fill_entity_sheet(workbook: Workbook, entity: EntitySummary | None = None) -> None:
@@ -405,6 +444,53 @@ def _entity_note(cluster: EntityClusterPlan) -> str:
     if cluster.status == "rejected":
         return "Kullanıcı reddetti: farklı ürünler. " + (cluster.reason or "")
     return cluster.reason or "Onaylı küme; canonical değere getirildi."
+
+
+def _fill_validation_sheet(workbook: Workbook, validation: ValidationReport | None = None) -> None:
+    """Report the validator's findings verbatim (spec §7).
+
+    Only a non-blocking run reaches the writer, so this sheet lists warnings in
+    practice; the schema still carries ``severity`` so an error stays legible if
+    a caller writes a report for one deliberately.
+    """
+
+    sheet = workbook.create_sheet("Validation")
+    sheet.append(
+        [
+            "check",
+            "severity",
+            "target_column",
+            "source_file",
+            "source_column",
+            "count",
+            "metric",
+            "message",
+            "samples",
+        ]
+    )
+    if validation is None:
+        sheet.append([None, "not_run", None, None, None, None, None, "Validator bu çalıştırmada koşmadı.", None])
+        _autosize(sheet)
+        return
+    if not validation.findings:
+        sheet.append([None, "ok", None, None, None, None, None, "Tutarsızlık bulunamadı.", None])
+        _autosize(sheet)
+        return
+    for finding in validation.findings:
+        sheet.append(
+            [
+                finding.check,
+                finding.severity,
+                finding.target_column,
+                finding.source_file,
+                finding.source_column,
+                finding.count,
+                finding.metric,
+                finding.message,
+                "; ".join(finding.samples) or None,
+            ]
+        )
+    _autosize(sheet)
 
 
 def _autosize(sheet) -> None:

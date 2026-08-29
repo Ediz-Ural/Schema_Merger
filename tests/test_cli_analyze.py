@@ -120,3 +120,37 @@ def test_analyze_reports_invalid_schema_without_creating_a_plan(tmp_path, capsys
     assert exit_code == 2
     assert "zorunlu alan eksik: output" in capsys.readouterr().out
     assert not output.exists()
+
+
+def test_a_provider_failure_is_reported_cleanly_and_writes_nothing(tmp_path, capsys):
+    """A refused provider call must not reach the user as a traceback."""
+
+    from core.llm import LLMClient, LLMRequestError
+
+    class RefusingClient(LLMClient):
+        def complete(self, system: str, user: str) -> str:
+            raise LLMRequestError(
+                "OpenAI isteği başarısız: Error code: 403 - model_not_found. "
+                "'gpt-5-nano' modeline erişim yok: sağlayıcı panelinden projeye izin ver."
+            )
+
+    output = tmp_path / "mapping.yaml"
+
+    exit_code = main(
+        [
+            "analyze",
+            "--inputs",
+            str(FIXTURES / "sales_2023.csv"),
+            "--target-schema",
+            str(FIXTURES / "schema.yaml"),
+            "--out",
+            str(output),
+        ],
+        llm_client=RefusingClient(),
+    )
+
+    assert exit_code == 2
+    assert not output.exists()
+    printed = capsys.readouterr().out
+    assert printed.startswith("Error: OpenAI isteği başarısız")
+    assert "Traceback" not in printed

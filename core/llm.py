@@ -17,13 +17,23 @@ from dataclasses import dataclass, field
 import json
 import os
 from typing import Mapping, Sequence
-from urllib import request
+from urllib import error as error_module, request
 
 from dotenv import load_dotenv
 
 
 class LLMConfigurationError(RuntimeError):
     """Raised when the selected provider has incomplete configuration."""
+
+
+class LLMRequestError(RuntimeError):
+    """Raised when a configured provider refuses or fails a request.
+
+    Configuration is fine but the call did not succeed -- a model the project
+    may not use, an expired key, a rate limit, an unreachable host.  The
+    provider's own message is kept because it names the cause; it never carries
+    the key itself.
+    """
 
 
 class LLMClient(ABC):
@@ -117,6 +127,28 @@ class FakeEmbeddingClient(EmbeddingClient):
         return [[float(value) for value in self.vectors.get(text, self.default)] for text in batch]
 
 
+def _request_error(provider: str, model: str, error: Exception) -> "LLMRequestError":
+    """Turn a provider SDK or transport failure into one honest message.
+
+    The provider's text names the cause (missing model access, revoked key,
+    rate limit) and is safe to show: SDK messages carry the request, never the
+    key.  A hint follows when the cause is a well-known one.
+    """
+
+    detail = str(error).strip() or type(error).__name__
+    hint = ""
+    lowered = detail.lower()
+    if "model_not_found" in lowered or "does not have access to model" in lowered:
+        hint = f" '{model}' modeline erişim yok: sağlayıcı panelinden projeye izin ver ya da modeli değiştir."
+    elif "invalid_api_key" in lowered or "incorrect api key" in lowered or "401" in lowered:
+        hint = " Anahtar geçersiz görünüyor; .env dosyandaki değeri kontrol et."
+    elif "rate limit" in lowered or "429" in lowered:
+        hint = " Hız sınırına takıldı; biraz bekleyip yeniden dene."
+    elif "connection" in lowered or "timed out" in lowered or "timeout" in lowered:
+        hint = " Sağlayıcıya ulaşılamadı; ağ bağlantısını kontrol et."
+    return LLMRequestError(f"{provider} isteği başarısız: {detail}.{hint}")
+
+
 @dataclass(frozen=True)
 class OpenAIClient(LLMClient):
     api_key: str
@@ -127,10 +159,13 @@ class OpenAIClient(LLMClient):
             from openai import OpenAI
         except ImportError as error:  # pragma: no cover - depends on optional SDK
             raise LLMConfigurationError("OpenAI kullanmak için 'openai' paketi kurulmalı.") from error
-        response = OpenAI(api_key=self.api_key).chat.completions.create(
-            model=self.model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        )
+        try:
+            response = OpenAI(api_key=self.api_key).chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            )
+        except Exception as error:  # provider SDK errors are a family, not one class
+            raise _request_error("OpenAI", self.model, error) from error
         return response.choices[0].message.content or ""
 
 
@@ -144,12 +179,15 @@ class AnthropicClient(LLMClient):
             from anthropic import Anthropic
         except ImportError as error:  # pragma: no cover - depends on optional SDK
             raise LLMConfigurationError("Anthropic kullanmak için 'anthropic' paketi kurulmalı.") from error
-        response = Anthropic(api_key=self.api_key).messages.create(
-            model=self.model,
-            max_tokens=1024,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
+        try:
+            response = Anthropic(api_key=self.api_key).messages.create(
+                model=self.model,
+                max_tokens=1024,
+                system=system,
+                messages=[{"role": "user", "content": user}],
+            )
+        except Exception as error:  # provider SDK errors are a family, not one class
+            raise _request_error("Anthropic", self.model, error) from error
         return "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
 
 
@@ -173,12 +211,15 @@ class OllamaClient(LLMClient):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with request.urlopen(http_request, timeout=self.timeout) as response:  # nosec B310 - configured local endpoint
-            body = json.loads(response.read().decode("utf-8"))
+        try:
+            with request.urlopen(http_request, timeout=self.timeout) as response:  # nosec B310 - configured local endpoint
+                body = json.loads(response.read().decode("utf-8"))
+        except (error_module.URLError, OSError, json.JSONDecodeError) as failure:
+            raise _request_error("Ollama", self.model, failure) from failure
         try:
             return body["message"]["content"]
         except (KeyError, TypeError) as error:
-            raise RuntimeError("Ollama beklenen tamamlama yanıtını döndürmedi.") from error
+            raise LLMRequestError("Ollama beklenen tamamlama yanıtını döndürmedi.") from error
 
 
 @dataclass(frozen=True)
@@ -194,7 +235,10 @@ class OpenAIEmbeddingClient(EmbeddingClient):
             from openai import OpenAI
         except ImportError as error:  # pragma: no cover - depends on optional SDK
             raise LLMConfigurationError("OpenAI kullanmak için 'openai' paketi kurulmalı.") from error
-        response = OpenAI(api_key=self.api_key).embeddings.create(model=self.model, input=batch)
+        try:
+            response = OpenAI(api_key=self.api_key).embeddings.create(model=self.model, input=batch)
+        except Exception as error:  # provider SDK errors are a family, not one class
+            raise _request_error("OpenAI embedding", self.model, error) from error
         return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
 
@@ -217,11 +261,14 @@ class OllamaEmbeddingClient(EmbeddingClient):
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with request.urlopen(http_request, timeout=self.timeout) as response:  # nosec B310 - configured local endpoint
-            body = json.loads(response.read().decode("utf-8"))
+        try:
+            with request.urlopen(http_request, timeout=self.timeout) as response:  # nosec B310 - configured local endpoint
+                body = json.loads(response.read().decode("utf-8"))
+        except (error_module.URLError, OSError, json.JSONDecodeError) as failure:
+            raise _request_error("Ollama embedding", self.model, failure) from failure
         vectors = body.get("embeddings") if isinstance(body, dict) else None
         if not isinstance(vectors, list) or len(vectors) != len(batch):
-            raise RuntimeError("Ollama beklenen embedding yanıtını döndürmedi.")
+            raise LLMRequestError("Ollama beklenen embedding yanıtını döndürmedi.")
         return [[float(value) for value in vector] for vector in vectors]
 
 
