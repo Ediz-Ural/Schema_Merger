@@ -1,0 +1,273 @@
+/* Traffic-light review screen: green is settled, yellow needs a decision, red
+   has no match yet (spec sections 6 and 12). */
+
+:root {
+  --ink: #16202b;
+  --muted: #5d6b7a;
+  --line: #d8e0e8;
+  --paper: #f6f8fa;
+  --auto: #1f8a4c;
+  --auto-bg: #e8f6ed;
+  --review: #b7791f;
+  --review-bg: #fdf5e3;
+  --unmatched: #c0392b;
+  --unmatched-bg: #fdecea;
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.app {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+}
+
+.app__head h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.app__tagline,
+.app__provider,
+.upload__hint,
+.review__hint {
+  color: var(--muted);
+  margin: 6px 0 0;
+}
+
+.banner {
+  margin: 20px 0;
+  padding: 14px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--unmatched);
+  background: var(--unmatched-bg);
+}
+
+.banner p {
+  margin: 0 0 6px;
+}
+
+.upload,
+.review,
+.result {
+  margin-top: 28px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.upload__field,
+.card__field {
+  display: block;
+  margin: 14px 0;
+}
+
+.upload__field span,
+.card__field span {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.card__field select,
+.card__field input {
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  font: inherit;
+}
+
+.review__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.review__head h2,
+.upload h2,
+.result h2 {
+  margin: 0;
+}
+
+.counts {
+  display: flex;
+  gap: 8px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.counts__item {
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.counts__item--auto {
+  background: var(--auto-bg);
+  color: var(--auto);
+}
+
+.counts__item--review {
+  background: var(--review-bg);
+  color: var(--review);
+}
+
+.counts__item--unmatched {
+  background: var(--unmatched-bg);
+  color: var(--unmatched);
+}
+
+.review__cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-left: 6px solid var(--line);
+  border-radius: 10px;
+  padding: 14px;
+  background: #fff;
+}
+
+.card--auto {
+  border-left-color: var(--auto);
+  background: var(--auto-bg);
+}
+
+.card--review {
+  border-left-color: var(--review);
+  background: var(--review-bg);
+}
+
+.card--unmatched {
+  border-left-color: var(--unmatched);
+  background: var(--unmatched-bg);
+}
+
+.card__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.card__title {
+  margin: 0;
+  font-size: 16px;
+}
+
+.card__file,
+.card__reason,
+.card__samples {
+  margin: 4px 0 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.card__badge {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.card--auto .card__badge {
+  color: var(--auto);
+}
+
+.card--review .card__badge {
+  color: var(--review);
+}
+
+.card--unmatched .card__badge {
+  color: var(--unmatched);
+}
+
+.card__meta {
+  display: flex;
+  gap: 18px;
+  margin: 10px 0 0;
+}
+
+.card__meta dt {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.card__meta dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.review__actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.review__blocked {
+  margin: 0;
+  color: var(--review);
+  font-size: 13px;
+}
+
+.button {
+  font: inherit;
+  padding: 9px 16px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: #fff;
+  color: var(--ink);
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+
+.button--primary {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: #fff;
+}
+
+.button--approve {
+  margin-top: 12px;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.result__stats {
+  display: flex;
+  gap: 18px;
+  list-style: none;
+  padding: 0;
+}
+
+.result__links {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 16px;
+}
