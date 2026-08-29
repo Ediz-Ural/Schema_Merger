@@ -213,7 +213,7 @@ def pending_reviews(mapping: MappingContract) -> list[tuple[str, SourceMatch]]:
 
     This is the review-guard predicate itself: the CLI and the web backend both
     read it, so ``apply`` refuses a blind merge on exactly the same rule
-    (spec section 5/14).
+    (değişmez karar: review varsa apply durur).
     """
 
     return [

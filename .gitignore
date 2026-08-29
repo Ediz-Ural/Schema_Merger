@@ -1,17 +1,30 @@
+# Gizli: sağlayıcı anahtarları
 .env
+
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+
+# Test ve kapsam çıktıları
 .pytest_cache/
-.pytest-tmp/
 .pytest-tmp*/
 pytest-cache-files-*/
-.agents/
-.venv/
-venv/
-dist/
-build/
 .coverage
 htmlcov/
-.DS_Store
+
+# Sanal ortamlar
+.venv/
+venv/
+
+# Web: bağımlılıklar, derleme çıktısı, çalışma zamanı verisi
 node_modules/
+dist/
+.web-sessions/
+*.db
+
+# Editör / araç yerel ayarları
+.claude/
+.agents/
+.DS_Store

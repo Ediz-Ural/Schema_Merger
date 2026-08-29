@@ -6,7 +6,7 @@ decimal just like a price in lira.  Merging either one silently produces a
 column whose numbers are not comparable.
 
 These guards run after the LLM proposes and only ever lower trust -- an ``auto``
-match becomes ``review`` so a human decides (spec sections 5 and 14).  They
+match becomes ``review`` so a human decides, never the model.  They
 never approve, never rewrite a column, and never touch data.
 """
 
