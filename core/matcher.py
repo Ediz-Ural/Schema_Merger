@@ -13,6 +13,7 @@ from typing import Any, Iterable, Sequence
 
 from core.contracts import MappingContract, SchemaContract
 from core.llm import LLMClient
+from core.semantics import apply_semantic_guards
 from core.types import ColumnProfile, FileProfile, MappingEntry, SourceMatch, TableProfile, TargetColumn
 
 
@@ -22,7 +23,11 @@ MAX_PROMPT_SAMPLES = 10
 _SYSTEM_PROMPT = """You match source table columns to a target schema for a vertical union plan.
 Return only JSON. Do not transform, generate, or write data rows. For every target column,
 select at most one source column from the supplied file or null if no match exists.
-Use names, inferred types, samples, and statistics. The exact JSON shape is:
+Use names, inferred types, samples, and statistics. Watch for traps a type check cannot see:
+a total, subtotal, or line amount is NOT a unit price; a value in another currency or unit is NOT
+the same measure; a tax or discount column is not a price. When a column could be an aggregate
+rather than a per-item value, or when its currency or unit is unclear, give a confidence below
+0.85 so a person reviews it. The exact JSON shape is:
 {"matches":[{"target_column":"...","column":"source_name or null","confidence":0.0,"reason":"..."}]}.
 Confidence must be between 0 and 1. Do not propose horizontal joins."""
 
@@ -76,12 +81,16 @@ class Matcher:
                         thresholds=self.thresholds,
                     )
                 )
-        return MappingContract(
+        proposed = MappingContract(
             entries=[
                 MappingEntry(target_column=target.name, sources=candidates_by_target[target.name])
                 for target in schema.target_columns
             ]
         )
+        # A deterministic pass that can only lower trust: matches whose meaning
+        # is suspect (an aggregate filling a per-item column, one target fed by
+        # two currencies) go to review instead of merging on the model's word.
+        return apply_semantic_guards(proposed, source_profiles)
 
 
 def match_profiles(

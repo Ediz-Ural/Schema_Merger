@@ -1,0 +1,4 @@
+item_name,qty,price_usd,order_date,customer_name,notes
+Pencil HB,10,8.90,2024-12-31,John Smith,bulk
+Notebook A5,2,15.00,2025-01-03,Jane Doe,
+"coca cola 0,33 lt",1,12.50,2025-01-08,Ahmet Yilmaz,
