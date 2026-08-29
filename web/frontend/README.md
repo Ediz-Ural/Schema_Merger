@@ -1,96 +1,96 @@
-# Schema Merger — Web UI (Aşama 6b)
+# Schema Merger — Web UI
 
-Teknik olmayan kullanıcı için görsel onay ekranı. React + TypeScript + Vite; iş
-mantığı yoktur — her karar `web/backend` (Aşama 6a) üzerinden aynı çekirdeğe
-gider.
+The visual approval screen for non-technical users. React + TypeScript + Vite, with no business
+logic of its own: every decision goes through `web/backend` to the same core.
 
-## Çalıştırma
+> The interface itself is in Turkish; this document is in English, like the
+> [top-level README](../../README.md).
 
-İki süreç gerekir: backend ve frontend.
+## Running it
+
+Two processes: the backend and the frontend.
 
 ```bash
-# 1) Backend (proje kökünde)
+# 1) Backend (from the project root)
 pip install -e ".[web]"
 uvicorn web.backend.main:app --reload        # http://127.0.0.1:8000
 
-# 2) Frontend (bu klasörde)
+# 2) Frontend (from this folder)
 npm install
 npm run dev                                  # http://localhost:5173
 ```
 
-Vite dev sunucusu `/api/*` isteklerini `http://127.0.0.1:8000` adresine
-yönlendirir; bu yüzden tarayıcı tek origin görür. Backend farklı bir adresteyse:
+The Vite dev server proxies `/api/*` to `http://127.0.0.1:8000`, so the browser sees a single
+origin. When the backend lives somewhere else:
 
 ```bash
-VITE_API_TARGET=http://127.0.0.1:9000 npm run dev   # dev proxy hedefi
-VITE_API_BASE=https://api.example.com npm run build # derlenmiş dağıtım
+VITE_API_TARGET=http://127.0.0.1:9000 npm run dev   # dev proxy target
+VITE_API_BASE=https://api.example.com npm run build # built deployment
 ```
 
-Derlenmiş dağıtımda backend'in `SCHEMA_MERGER_CORS_ORIGINS` değişkenine
-frontend'in origin'ini eklemeyi unutmayın.
+For a built deployment, remember to add the frontend's origin to the backend's
+`SCHEMA_MERGER_CORS_ORIGINS`.
 
-## Hesap ve API anahtarı
+## Account and API key
 
-İlk açılışta giriş ekranı gelir: **hesap oluştur** (e-posta + en az 8 karakter
-parola) ya da **giriş yap**. Giriş sonrası üst çubuktaki sağlayıcı rozetinden
-ayarlar açılır ve kullanıcı **kendi sağlayıcısını, modelini ve API anahtarını**
-girer (`PUT /provider`).
+The first screen is the gate: **create an account** (e-mail + a password of at least 8
+characters) or **sign in**. After signing in, the provider chip in the top bar opens the
+settings, where the user enters **their own provider, model and API key** (`PUT /provider`).
 
-Anahtar tarayıcıda **hiç saklanmaz**: bir kez sunucuya gönderilir ve orada
-yalnızca süreç belleğinde tutulur; hiçbir yanıtta geri gelmediği için ayarlar
-alanı boş görünür — boş bırakmak "kayıtlı anahtarı koru" demektir. `localStorage`
-yalnızca oturum token'ını tutar. Çıkış yapınca ya da sunucu yeniden başlayınca
-anahtar unutulur ve yeniden girilir.
+The key is **never stored in the browser**: it is sent to the server once and held there in
+process memory only. No response ever returns it, which is why the settings field looks empty —
+leaving it empty means "keep the key you already hold". `localStorage` holds the session token
+and nothing else. Signing out or restarting the server forgets the key, and it is entered again.
 
-Anahtar tanımlı değilken "Analiz et" pasiftir ve ekran ayarlara yönlendirir;
-sunucu `503 llm_not_configured` dönerse ayarlar penceresi kendiliğinden açılır.
+While no key is configured, "Analiz et" is disabled and the screen points at the settings; if
+the server answers `503 llm_not_configured`, the settings dialog opens by itself.
 
-## Akış
+## The flow
 
-1. **Yükle** — kaynak tablolar (`.csv`, `.xlsx`) + `schema.yaml` → `POST /upload`.
-2. **Analiz** — `POST /analyze` planı üretir (LLM yalnızca burada), `GET /columns`
-   düzeltme dropdown'ını dolduracak gerçek sütunları getirir.
-3. **Onay** — plan kart olarak gösterilir:
+1. **Upload** — source tables (`.csv`, `.xlsx`) + `schema.yaml` → `POST /upload`.
+2. **Analyze** — `POST /analyze` produces the plan (the only place an LLM runs), and
+   `GET /columns` fetches the real columns that fill the correction dropdown.
+3. **Approve** — the plan is shown as cards:
 
-   | Kart | Durum | Anlamı |
+   | Card | Status | Meaning |
    | --- | --- | --- |
-   | 🟢 yeşil | `auto` | Otomatik eşleşti, onaylı. |
-   | 🟡 sarı | `review` | Karar sizde; **birleştirmeyi durdurur**. |
-   | 🔴 kırmızı | `unmatched` | Eşleşme yok; sütun seçin ya da boş bırakın. |
+   | 🟢 green | `auto` | Matched automatically, approved. |
+   | 🟡 amber | `review` | Your call; **it blocks the merge**. |
+   | 🔴 red | `unmatched` | No match; pick a column or leave it empty. |
 
-   Her kartta hedef sütun, kaynak dosya, güven yüzdesi, gerekçe ve örnek
-   değerler görünür. Düzeltme dropdown iledir: seçenekler o dosyada **gerçekten
-   var olan** sütunlardır; `(boş bırak)` bilinçli olarak eşlememek demektir.
-   Düzenlemeler `PUT /mapping` ile yazılır.
-4. **Birleştir** — `POST /apply`. Buton **yalnızca hiç `review` kalmadığında**
-   aktiftir; backend aynı kuralı `409` ile uygular, o yanıt geldiğinde ekran
-   nedenini ve "hiçbir dosya yazılmadı" bilgisini gösterir.
-5. **İndir** — `merged.<fmt>` ve `merge_report.xlsx` bağlantıları.
+   Each card shows the target column, the source file, the confidence, the reason and sample
+   values. Corrections come from a dropdown whose options are the columns that **actually
+   exist** in that file; `(boş bırak)` means deliberately leaving it unmatched. Edits are
+   written with `PUT /mapping`.
+4. **Merge** — `POST /apply`. The button is enabled **only when no `review` remains**; the
+   backend enforces the same rule with `409`, and when that answer arrives the screen shows why
+   and states that nothing was written.
+5. **Download** — `merged.<fmt>` and `merge_report.xlsx`.
 
-## Değişmezler
+## Invariants
 
-- Ekran hiçbir eşleştirme kararı üretmez; profil, eşleştirme, validator ve
-  tekilleştirme backend'deki çekirdekte kalır.
-- Her istek `Authorization: Bearer <token>` taşır; oturum düşerse (401) ekran
-  giriş formuna döner ve token silinir. Çıktı indirmeleri de aynı token'la
-  çekilir, bu yüzden bağlantı değil buton olarak sunulur.
-- "Birleştir" review varken pasiftir (kör birleştirme yok) ve iki fazlı akış
-  ekranda görünür: önce plan onayı, sonra birleştirme.
-- API anahtarı tarayıcıda saklanmaz ve sunucudan geri gelmez. `GET /provider`
-  yalnızca sağlayıcıyı, modeli ve anahtarın tanımlı olup olmadığını döndürür.
-- Entity resolution (`cluster`) bu ekranda yoktur; CLI ya da API ile yapılır ve
-  `apply` onaylı kümeleri yine uygular.
+- The screen makes no matching decision; profiling, matching, validation and deduplication stay
+  in the core behind the backend.
+- Every request carries `Authorization: Bearer <token>`; when the session drops (401) the screen
+  returns to the sign-in form and the token is cleared. Artifacts are fetched with the same
+  token, which is why they are buttons rather than links.
+- "Birleştir" is disabled while a review remains (no blind merge), and the two-phase flow is
+  visible on screen: approval first, merging second.
+- The API key is not stored in the browser and never comes back from the server.
+  `GET /provider` reports only the provider, the model, and whether a key is held.
+- Entity resolution (`cluster`) is not part of this screen; it is done from the CLI or the API,
+  and `apply` still applies approved clusters.
 
-## Testler
+## Tests
 
 ```bash
-npm test          # vitest + Testing Library (backend mock'lanır)
+npm test          # vitest + Testing Library (the backend is mocked)
 npm run build     # tsc --noEmit + vite build
 ```
 
-Testler ağa çıkmaz: `src/api.ts` mock'lanır. Kapsananlar: giriş/kayıt akışı ve
-reddedilen girişin kullanıcıya iletilmesi, anahtar girilmeden analizin
-engellenmesi, girilen anahtarın sunucuya gidip tarayıcıda kalmaması, kart
-renkleri, review varken "Birleştir" pasif / çözülünce aktif, dropdown
-düzeltmesinin `PUT /mapping` çağrısına dönüşmesi, apply sonrası indirme
-düğmeleri, `409` yanıtının açıklanması ve oturum düşünce giriş formuna dönüş.
+The tests never reach the network: `src/api.ts` is mocked. They cover the sign-in and
+registration flow and how a refused sign-in reaches the user, analysis being blocked until a key
+is entered, the entered key going to the server without staying in the browser, the card
+colours, "Birleştir" disabled while a review remains and enabled once resolved, a dropdown
+correction turning into a `PUT /mapping` call, the download buttons after apply, the `409`
+answer being explained, and the return to the sign-in form when the session expires.
