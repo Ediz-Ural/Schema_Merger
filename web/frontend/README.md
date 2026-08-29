@@ -29,6 +29,22 @@ VITE_API_BASE=https://api.example.com npm run build # derlenmiş dağıtım
 Derlenmiş dağıtımda backend'in `SCHEMA_MERGER_CORS_ORIGINS` değişkenine
 frontend'in origin'ini eklemeyi unutmayın.
 
+## Hesap ve API anahtarı
+
+İlk açılışta giriş ekranı gelir: **hesap oluştur** (e-posta + en az 8 karakter
+parola) ya da **giriş yap**. Giriş sonrası üst çubuktaki sağlayıcı rozetinden
+ayarlar açılır ve kullanıcı **kendi sağlayıcısını, modelini ve API anahtarını**
+girer (`PUT /provider`).
+
+Anahtar tarayıcıda **hiç saklanmaz**: bir kez sunucuya gönderilir ve orada
+yalnızca süreç belleğinde tutulur; hiçbir yanıtta geri gelmediği için ayarlar
+alanı boş görünür — boş bırakmak "kayıtlı anahtarı koru" demektir. `localStorage`
+yalnızca oturum token'ını tutar. Çıkış yapınca ya da sunucu yeniden başlayınca
+anahtar unutulur ve yeniden girilir.
+
+Anahtar tanımlı değilken "Analiz et" pasiftir ve ekran ayarlara yönlendirir;
+sunucu `503 llm_not_configured` dönerse ayarlar penceresi kendiliğinden açılır.
+
 ## Akış
 
 1. **Yükle** — kaynak tablolar (`.csv`, `.xlsx`) + `schema.yaml` → `POST /upload`.
@@ -55,11 +71,13 @@ frontend'in origin'ini eklemeyi unutmayın.
 
 - Ekran hiçbir eşleştirme kararı üretmez; profil, eşleştirme, validator ve
   tekilleştirme backend'deki çekirdekte kalır.
+- Her istek `Authorization: Bearer <token>` taşır; oturum düşerse (401) ekran
+  giriş formuna döner ve token silinir. Çıktı indirmeleri de aynı token'la
+  çekilir, bu yüzden bağlantı değil buton olarak sunulur.
 - "Birleştir" review varken pasiftir (kör birleştirme yok) ve iki fazlı akış
   ekranda görünür: önce plan onayı, sonra birleştirme.
-- API anahtarı tarayıcıya hiç gelmez. `GET /provider` yalnızca sağlayıcı adını,
-  modeli ve anahtarın yapılandırılmış olup olmadığını döndürür; anahtar
-  istekle gönderilmez, `localStorage`'a yazılmaz.
+- API anahtarı tarayıcıda saklanmaz ve sunucudan geri gelmez. `GET /provider`
+  yalnızca sağlayıcıyı, modeli ve anahtarın tanımlı olup olmadığını döndürür.
 - Entity resolution (`cluster`) bu ekranda yoktur; CLI ya da API ile yapılır ve
   `apply` onaylı kümeleri yine uygular.
 
@@ -70,7 +88,9 @@ npm test          # vitest + Testing Library (backend mock'lanır)
 npm run build     # tsc --noEmit + vite build
 ```
 
-Testler ağa çıkmaz: `src/api.ts` mock'lanır. Kapsananlar: kart renkleri
-status'a göre, review varken "Birleştir" pasif / çözülünce aktif, dropdown
+Testler ağa çıkmaz: `src/api.ts` mock'lanır. Kapsananlar: giriş/kayıt akışı ve
+reddedilen girişin kullanıcıya iletilmesi, anahtar girilmeden analizin
+engellenmesi, girilen anahtarın sunucuya gidip tarayıcıda kalmaması, kart
+renkleri, review varken "Birleştir" pasif / çözülünce aktif, dropdown
 düzeltmesinin `PUT /mapping` çağrısına dönüşmesi, apply sonrası indirme
-linkleri ve `409` yanıtının kullanıcıya açıklanması.
+düğmeleri, `409` yanıtının açıklanması ve oturum düşünce giriş formuna dönüş.

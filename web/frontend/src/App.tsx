@@ -1,27 +1,40 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import * as api from "./api";
 import { ApiError } from "./api";
+import AppHeader from "./components/AppHeader";
+import AuthPanel, { type AuthMode } from "./components/AuthPanel";
 import MappingReview from "./components/MappingReview";
 import ResultPanel from "./components/ResultPanel";
+import SettingsPanel from "./components/SettingsPanel";
+import StepBar from "./components/StepBar";
 import UploadPanel from "./components/UploadPanel";
 import type {
   ApplyResult,
   Columns,
   Mapping,
   ProviderInfo,
+  ProviderSettings,
   ReviewGuardDetail,
   SourceMatch,
+  User,
 } from "./types";
 
-/** The whole two-phase flow, in the order the user walks it.
+/** The whole product: sign in, bring your own key, then the two-phase flow.
  *
- * Nothing here re-implements a rule: analyze proposes, the user approves, and
- * apply merges only when the backend lets it.  A refused apply (409) is shown
+ * Nothing here re-implements a rule.  Analyze proposes, the user approves, and
+ * apply merges only when the backend lets it; a refused apply (409) is shown
  * with its own message and the plan stays exactly as it was.
  */
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [checking, setChecking] = useState(api.getToken() !== null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const [provider, setProvider] = useState<ProviderInfo | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [mapping, setMapping] = useState<Mapping | null>(null);
   const [columns, setColumns] = useState<Columns | null>(null);
@@ -31,14 +44,49 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [guard, setGuard] = useState<ReviewGuardDetail | null>(null);
 
-  useEffect(() => {
-    api.getProvider().then(setProvider).catch(() => setProvider(null));
+  const signOutLocally = useCallback(() => {
+    api.setToken(null);
+    setUser(null);
+    setProvider(null);
+    setSessionId(null);
+    setMapping(null);
+    setColumns(null);
+    setResult(null);
   }, []);
+
+  const loadProvider = useCallback(() => {
+    api
+      .getProvider()
+      .then(setProvider)
+      .catch(() => setProvider(null));
+  }, []);
+
+  useEffect(() => {
+    if (api.getToken() === null) {
+      return;
+    }
+    api
+      .me()
+      .then((account) => {
+        setUser(account);
+        loadProvider();
+      })
+      .catch(() => signOutLocally())
+      .finally(() => setChecking(false));
+  }, [loadProvider, signOutLocally]);
 
   const fail = (problem: unknown) => {
     if (problem instanceof ApiError) {
+      if (problem.unauthorized) {
+        signOutLocally();
+        setAuthError("Oturumun süresi doldu, tekrar giriş yap.");
+        return;
+      }
       setError(problem.message);
       setGuard(problem.guard);
+      if (problem.missingKey) {
+        setSettingsOpen(true);
+      }
       return;
     }
     setError(problem instanceof Error ? problem.message : String(problem));
@@ -49,6 +97,59 @@ export default function App() {
     setError(null);
     setGuard(null);
   };
+
+  /* -- accounts -------------------------------------------------------- */
+
+  const authenticate = async (mode: AuthMode, email: string, password: string) => {
+    setBusy(true);
+    setAuthError(null);
+    try {
+      const account = mode === "login" ? await api.login(email, password) : await api.register(email, password);
+      setUser(account);
+      loadProvider();
+    } catch (problem) {
+      setAuthError(problem instanceof Error ? problem.message : String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    try {
+      await api.logout();
+    } finally {
+      signOutLocally();
+    }
+  };
+
+  /* -- provider settings ------------------------------------------------ */
+
+  const saveSettings = async (settings: ProviderSettings) => {
+    setBusy(true);
+    setSettingsError(null);
+    try {
+      setProvider(await api.saveProvider(settings));
+      setSettingsOpen(false);
+    } catch (problem) {
+      setSettingsError(problem instanceof Error ? problem.message : String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const forgetKey = async () => {
+    setBusy(true);
+    setSettingsError(null);
+    try {
+      setProvider(await api.forgetKey());
+    } catch (problem) {
+      setSettingsError(problem instanceof Error ? problem.message : String(problem));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /* -- the flow --------------------------------------------------------- */
 
   const start = async (files: File[], schema: File) => {
     setBusy(true);
@@ -127,20 +228,35 @@ export default function App() {
     clearError();
   };
 
+  /* -- render ----------------------------------------------------------- */
+
+  if (checking) {
+    return (
+      <main className="app app--center">
+        <p className="loading">Oturum kontrol ediliyor…</p>
+      </main>
+    );
+  }
+
+  if (!user) {
+    return <AuthPanel busy={busy} error={authError} onSubmit={authenticate} />;
+  }
+
+  const step = result ? "done" : mapping ? "review" : "upload";
+
   return (
     <main className="app">
-      <header className="app__head">
-        <h1>Schema Merger</h1>
-        <p className="app__tagline">
-          Önce plan onaylanır, sonra birleştirilir. Onaysız hiçbir sütun birleştirilmez.
-        </p>
-        {provider ? (
-          <p className="app__provider">
-            Sağlayıcı: <strong>{provider.provider}</strong> ({provider.model || "model yok"}) —{" "}
-            {provider.configured ? "anahtar yapılandırılmış" : "anahtar yok"}
-          </p>
-        ) : null}
-      </header>
+      <AppHeader
+        user={user}
+        provider={provider}
+        onOpenSettings={() => {
+          setSettingsError(null);
+          setSettingsOpen(true);
+        }}
+        onLogout={signOut}
+      />
+
+      <StepBar current={step} />
 
       {error ? (
         <div className="banner banner--error" role="alert">
@@ -179,8 +295,24 @@ export default function App() {
           onApply={merge}
         />
       ) : (
-        <UploadPanel busy={busy} onStart={start} />
+        <UploadPanel
+          busy={busy}
+          ready={provider?.configured ?? false}
+          onStart={start}
+          onOpenSettings={() => setSettingsOpen(true)}
+        />
       )}
+
+      {settingsOpen ? (
+        <SettingsPanel
+          provider={provider}
+          busy={busy}
+          error={settingsError}
+          onSave={saveSettings}
+          onForget={forgetKey}
+          onClose={() => setSettingsOpen(false)}
+        />
+      ) : null}
     </main>
   );
 }

@@ -103,6 +103,30 @@ export interface ProviderInfo {
   provider: string;
   embedding_provider: string;
   model: string;
+  embedding_model?: string;
   configured: boolean;
   detail?: string | null;
+}
+
+/** An account as the browser may see it -- never a key, never a hash. */
+export interface User {
+  id: number;
+  email: string;
+  provider: string;
+  model: string;
+  embedding_model?: string;
+  key_configured: boolean;
+}
+
+export interface SessionToken {
+  token: string;
+  user: User;
+}
+
+/** What the settings screen sends. `api_key` is stored server-side only. */
+export interface ProviderSettings {
+  provider: string;
+  model?: string | null;
+  embedding_model?: string | null;
+  api_key?: string | null;
 }

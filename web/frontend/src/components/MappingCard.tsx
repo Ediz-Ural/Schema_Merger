@@ -2,7 +2,7 @@ import { useMemo, useState } from "react";
 
 import type { MappingStatus, SourceColumn, SourceMatch } from "../types";
 
-/** Colour code of the review screen (spec sections 6 and 12). */
+/** Colour code of the review screen: settled, undecided, unmatched. */
 const STATUS_LABEL: Record<MappingStatus, string> = {
   auto: "Otomatik eşleşti",
   review: "Onayınız gerekiyor",

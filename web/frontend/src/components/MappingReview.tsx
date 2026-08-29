@@ -14,8 +14,7 @@ export interface MappingReviewProps {
 /** Phase 1 approval screen: every proposal as a card, then the merge button.
  *
  * The button is disabled while a single match is still `review`, which is the
- * same guard the backend answers `409` with -- shown here so the user sees why
- * (spec sections 5 and 14).
+ * same guard the backend answers `409` with -- shown here so the user sees why.
  */
 export function MappingReview({
   mapping,
@@ -32,20 +31,23 @@ export function MappingReview({
     columns?.files.find((item) => item.file === file)?.columns ?? [];
 
   return (
-    <section className="review">
-      <header className="review__head">
-        <h2>2. Planı onaylayın</h2>
-        <ul className="counts">
-          <li className="counts__item counts__item--auto">{counts.auto} otomatik</li>
-          <li className="counts__item counts__item--review">{counts.review} onay bekliyor</li>
-          <li className="counts__item counts__item--unmatched">{counts.unmatched} eşleşmedi</li>
-        </ul>
+    <section className="panel review">
+      <header className="panel__head">
+        <div>
+          <h2>Planı onaylayın</h2>
+          <p className="panel__sub">
+            Sarı kartlar karar bekliyor, kırmızı kartlarda eşleşme yok. Doğru kaynak sütunu seçin ya
+            da sütunu boş bırakın.
+          </p>
+        </div>
+        <span className="pill">adım 2</span>
       </header>
 
-      <p className="review__hint">
-        Sarı kartlar karar bekliyor, kırmızı kartlarda eşleşme yok. Her kartta doğru kaynak
-        sütunu seçebilir ya da sütunu boş bırakabilirsiniz.
-      </p>
+      <ul className="counts">
+        <li className="counts__item counts__item--auto">{counts.auto} otomatik</li>
+        <li className="counts__item counts__item--review">{counts.review} onay bekliyor</li>
+        <li className="counts__item counts__item--unmatched">{counts.unmatched} eşleşmedi</li>
+      </ul>
 
       <div className="review__cards">
         {mapping.entries.map((entry: MappingEntry, entryIndex) =>
