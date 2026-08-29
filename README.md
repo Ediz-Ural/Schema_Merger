@@ -2,53 +2,56 @@
 
 # Schema Merger
 
-**Dağınık CSV/Excel tablolarını, onayladığınız bir planla tek tabloda birleştirin.**
+**Merge messy CSV/Excel tables into one clean table — from a plan you approve.**
 
-LLM yalnızca *öneri* üretir; birleştirmeyi siz onaylarsınız ve uygulama adımı tümüyle deterministiktir.
+The LLM only *proposes*. You approve the plan, and the step that touches your data is fully deterministic.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=black)](https://react.dev/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Testler](https://img.shields.io/badge/testler-235%20pytest%20%2B%2022%20vitest-2ea44f)](#-testler)
-[![Kapsam](https://img.shields.io/badge/kapsam-%2590-2ea44f)](#-testler)
-[![Lisans](https://img.shields.io/badge/lisans-MIT-blue)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-235%20pytest%20%2B%2022%20vitest-2ea44f)](#-tests)
+[![Coverage](https://img.shields.io/badge/coverage-90%25-2ea44f)](#-tests)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-[Ne işe yarar?](#-ne-işe-yarar) · [Hızlı başlangıç](#-hızlı-başlangıç) · [Nasıl çalışır](#-nasıl-çalışır) · [Web arayüzü](#-web-arayüzü) · [Dağıtım](#-dağıtım) · [Değişmez kararlar](#-değişmez-kararlar)
+[What it does](#-what-it-does) · [Quick start](#-quick-start) · [How it works](#-how-it-works) · [Web UI](#-web-ui) · [Deployment](#-deployment) · [Invariants](#-invariants)
 
 </div>
 
+> **Note on language.** This documentation is in English; the CLI output and the web
+> interface speak Turkish, as do the reasons written into `mapping.yaml`.
+
 ---
 
-## 🧩 Ne işe yarar?
+## 🧩 What it does
 
-Elinizde aynı işi anlatan ama birbirini tutmayan tablolar var:
+You have tables that describe the same thing but agree on nothing:
 
-| `subeA_2023.csv` | `export_q4.csv` | `kasa_ozet.csv` |
+| `branch_a_2023.csv` | `export_q4.csv` | `register_summary.csv` |
 | --- | --- | --- |
 | `Ürün Adı` · `Adet` · `Birim Fiyat (TL)` | `item_name` · `qty` · `price_usd` | `PRD` · `MIKTAR` · `TUTAR` |
 | `31.12.2024` · `12,50` | `2024-12-31` · `12.50` | `09.01.2025` · `20,00` |
 
-Schema Merger bunları **tek bir hedef şemaya** göre alt alta birleştirir: sütun adlarını
-eşleştirir, Türkçe/İngilizce sayı ve tarih biçimlerini normalize eder, her satırın nereden
-geldiğini yazar — ve **onayınız olmadan hiçbir sütunu birleştirmez**.
+Schema Merger appends them into **one target schema**: it matches column names, normalises
+Turkish/English number and date formats, records where every row came from — and **merges
+nothing without your approval**.
 
 > [!IMPORTANT]
-> Bu bir "sihirli birleştirici" değil. Araç bir **plan** üretir, planı siz onaylarsınız,
-> sonra plan harfiyen uygulanır. Onaylanmamış tek bir eşleştirme varsa birleştirme durur.
+> This is not a magic merger. The tool produces a **plan**, you approve the plan, and then the
+> plan is applied to the letter. If a single match is still unapproved, the merge stops.
 
-**Öne çıkanlar**
+**Highlights**
 
-- 🔍 **Profil tabanlı eşleştirme** — LLM'e satır verisi değil, yalnızca sütun profilleri gider.
-- ✋ **İnsan onayı zorunlu** — `review` durumundaki tek bir satır bile `apply`'ı durdurur.
-- 🧾 **Provenance her zaman** — her satırda hangi dosya, hangi sütun bilgisi durur.
-- 🛡️ **Üç koruma katmanı** — review-guard, semantik tuzak koruması ve validator.
-- 🔗 **Entity resolution** — `Coca-Cola 33cl` ile `coca cola 0,33 lt`'yi aynı ürüne indirger.
-- 🖥️ **CLI + Web** — ikisi de **aynı çekirdeği** kullanır; iş mantığı tek yerde.
-- 🔑 **Kendi anahtarın** — web'de her kullanıcı kendi API anahtarını girer, anahtar diske yazılmaz.
+- 🔍 **Profile-based matching** — the LLM sees column profiles, never your rows.
+- ✋ **Human approval required** — one match left in `review` stops `apply`.
+- 🧾 **Provenance always** — every row carries the file and column it came from.
+- 🛡️ **Three guard layers** — the review guard, semantic trap guards, and the validator.
+- 🔗 **Entity resolution** — folds `Coca-Cola 33cl` and `coca cola 0,33 lt` into one product.
+- 🖥️ **CLI + Web** — both drive the **same core**; the logic lives in exactly one place.
+- 🔑 **Bring your own key** — each web user enters their own API key, and it never touches disk.
 
 ---
 
-## 🚀 Hızlı başlangıç
+## 🚀 Quick start
 
 ```bash
 git clone https://github.com/Ediz-Ural/Schema_Merger.git
@@ -58,26 +61,26 @@ pip install -e ".[dev]" && pip install -e ".[openai]"
 ```
 
 <table>
-<tr><th width="50%">💻 Komut satırı</th><th width="50%">🖥️ Web arayüzü</th></tr>
+<tr><th width="50%">💻 Command line</th><th width="50%">🖥️ Web interface</th></tr>
 <tr valign="top"><td>
 
 ```bash
-# anahtarınızı .env dosyasına koyun
+# put your key in .env
 cp .env.example .env
 
-# Faz 1 — plan üret (LLM burada)
+# Phase 1 — produce a plan (the LLM runs here)
 merger analyze --inputs a.csv b.xlsx \
                --target-schema schema.yaml \
                --out mapping.yaml
 
-# mapping.yaml'daki review satırlarını çözün
+# resolve the review rows in mapping.yaml
 
-# Faz 2 — birleştir (LLM yok)
+# Phase 2 — merge (no LLM)
 merger apply --mapping mapping.yaml \
              --out merged.xlsx --format xlsx
 ```
 
-Anahtar `.env`'den okunur, repoya girmez.
+The key is read from `.env` and never enters the repository.
 
 </td><td>
 
@@ -89,35 +92,35 @@ cd web/frontend
 npm install && npm run dev              # :5173
 ```
 
-Tarayıcıda **http://localhost:5173** → hesap oluştur →
-sağlayıcı rozetinden **kendi anahtarını ve modelini** gir →
-dosyaları yükle → kartları onayla → indir.
+Open **http://localhost:5173** → create an account →
+enter **your own key and model** from the provider chip →
+upload files → approve the cards → download.
 
 </td></tr>
 </table>
 
-> Denemek için hazır veri: `tests/fixtures/live/` klasöründeki üç CSV ve `schema.yaml`
-> — kasıtlı olarak tuzaklı hazırlanmıştır (farklı diller, kısaltmalar, TL/USD karışımı).
+> Ready-made sample data: the three CSVs and `schema.yaml` under `tests/fixtures/live/`
+> — deliberately full of traps (different languages, abbreviations, mixed TRY/USD).
 
 ---
 
-## ⚙️ Nasıl çalışır
+## ⚙️ How it works
 
 ```mermaid
 flowchart LR
-    A[CSV / XLSX<br/>kaynaklar] --> B[profile<br/>sütun profilleri]
+    A[CSV / XLSX<br/>sources] --> B[profile<br/>column profiles]
     B --> C{{"analyze — LLM"}}
-    C --> D[mapping.yaml<br/>öneri + güven + gerekçe]
-    D --> E{{"semantik koruma<br/>deterministik"}}
-    E --> F[/kullanıcı onayı/]
-    F -->|review kaldıysa| G[apply durur<br/>hiçbir dosya yazılmaz]
-    F -->|hepsi çözüldü| H[apply<br/>transform + validator]
+    C --> D[mapping.yaml<br/>proposal + confidence + reason]
+    D --> E{{"semantic guards<br/>deterministic"}}
+    E --> F[/human approval/]
+    F -->|review remains| G[apply stops<br/>nothing is written]
+    F -->|all resolved| H[apply<br/>transform + validator]
     H --> I[(merged.xlsx / csv / sql<br/>+ merge_report.xlsx)]
 ```
 
-**Faz 1 — `analyze` (LLM burada).** Her dosyanın sütunları profillenir: ad, tür, örnek
-değerler, benzersiz sayısı, boş oranı, min/max, biçim ipuçları. LLM'e **yalnızca bu profiller**
-gider; satır verisi hiçbir zaman sağlayıcıya çıkmaz. Sonuç, okunabilir bir plan dosyasıdır:
+**Phase 1 — `analyze` (the LLM runs here).** Every file's columns are profiled: name, type,
+sample values, distinct count, null ratio, min/max, format hints. **Only those profiles** go to
+the model; row data never leaves for a provider. The result is a readable plan file:
 
 ```yaml
 - target_column: unit_price
@@ -129,137 +132,138 @@ gider; satır verisi hiçbir zaman sağlayıcıya çıkmaz. Sonuç, okunabilir b
       reason: "Ondalık örnekler örtüşüyor."
 ```
 
-**Onay.** `auto` onaylı, `review` sizin kararınızı bekliyor, `unmatched` bilinçli olarak boş.
-Web arayüzünde bunlar 🟢 / 🟡 / 🔴 kartlardır.
+**Approval.** `auto` is settled, `review` waits for your decision, `unmatched` is deliberately
+empty. In the web UI these are 🟢 / 🟡 / 🔴 cards.
 
-**Faz 2 — `apply` (LLM yok).** Aynı plan iki kez uygulanırsa aynı çıktı üretilir: dikey
-(union/append) birleştirme, TR/EN sayı ve tarih normalizasyonu, provenance sütunları ve yanında
-`merge_report.xlsx`.
+**Phase 2 — `apply` (no LLM).** Applying the same plan twice produces the same output: a
+vertical (union/append) merge, Turkish/English number and date normalisation, provenance
+columns, and `merge_report.xlsx` alongside the result.
 
 <details>
-<summary><b>Komutlar ve çıkış kodları</b></summary>
+<summary><b>Commands and exit codes</b></summary>
 
-| Komut | Ne yapar | Anahtar ister mi? |
+| Command | What it does | Needs a key? |
 | --- | --- | --- |
-| `merger profile --input a.csv` | Tek dosyayı profiller | ❌ |
-| `merger analyze --inputs … --out mapping.yaml` | Plan üretir | ✅ |
-| `merger cluster --mapping … --column …` | Entity kümeleri önerir | ✅ |
-| `merger apply --mapping … --out merged.xlsx` | Deterministik birleştirir | ❌ |
+| `merger profile --input a.csv` | Profiles one file | ❌ |
+| `merger analyze --inputs … --out mapping.yaml` | Produces a plan | ✅ |
+| `merger cluster --mapping … --column …` | Proposes entity clusters | ✅ |
+| `merger apply --mapping … --out merged.xlsx` | Merges deterministically | ❌ |
 
-`0` başarılı · `2` girdi/yapılandırma hatası (dosya yok, şema bozuk, anahtar yok, sağlayıcı
-isteği reddetti) · `3` review-guard ya da validator birleştirmeyi durdurdu.
+`0` success · `2` input or configuration error (missing file, broken schema, no key, provider
+refused the request) · `3` the review guard or the validator stopped the merge.
 
-Sağlayıcı hataları (erişilmeyen model, geçersiz anahtar, hız sınırı, ağ) ham traceback olarak
-değil, ne yapılacağını söyleyen tek satırlık bir mesaj olarak düşer.
+Provider failures (a model you cannot reach, an invalid key, a rate limit, a network problem)
+arrive as a single line that says what to do — never as a raw traceback.
 
 </details>
 
 ---
 
-## 🛡️ Üç koruma katmanı
+## 🛡️ Three guard layers
 
-| | Katman | Ne yapar |
+| | Layer | What it does |
 | --- | --- | --- |
-| 1️⃣ | **Review-guard** | Planda çözülmemiş tek bir `review` kalırsa `apply` **durur**, bekleyen satırları listeler ve **hiçbir çıktı yazmaz** (çıkış kodu `3`, API'de `409`). |
-| 2️⃣ | **Semantik tuzak koruması** | Tip denetiminin göremediğini yakalar: satır **toplamının** birim fiyat sanılması, aynı hedef sütunun **TL ve USD**'den beslenmesi. Model ne kadar emin olursa olsun `review`'a düşer. |
-| 3️⃣ | **Validator** | Yazmadan hemen önce, LLM'siz: tip uyuşmazlığı, eşlendiği hâlde boş kalan sütun, aykırı değer, `required` ihlali. Ciddi bulgu birleştirmeyi durdurur. |
+| 1️⃣ | **Review guard** | If one unresolved `review` remains, `apply` **stops**, lists the pending rows and **writes nothing** (exit code `3`, HTTP `409`). |
+| 2️⃣ | **Semantic trap guards** | Catches what a type check cannot see: a line **total** taken for a unit price, one target column fed by **TRY and USD**. However confident the model is, the match drops to `review`. |
+| 3️⃣ | **Validator** | Just before writing, with no LLM: type mismatch, a column mapped yet left empty, outliers, `required` violations. A serious finding stops the merge. |
 
 <details>
-<summary><b>Semantik tuzak koruması — ayrıntı</b></summary>
+<summary><b>Semantic trap guards — detail</b></summary>
 
-`analyze`, LLM önerdikten sonra **deterministik bir ikinci göz** çalıştırır
-(`core/semantics.py`). Bu geçiş yalnızca **güveni düşürür** — bir eşleştirmeyi asla onaylamaz,
-veriye dokunmaz:
+After the LLM proposes, `analyze` runs a **deterministic second opinion**
+(`core/semantics.py`). That pass may only **lower** trust — it never approves a match and never
+touches data:
 
-- **Toplam ↔ birim.** Hedef birim başına bir değer beklerken kaynak sütun
-  toplam/tutar/ara toplam/KDV gibi bir toplulaştırma ise (ya da tersi), eşleştirme `review`'a
-  düşer. Örnek: `TUTAR` (2 × 10,00 = 20,00) → `unit_price`.
-- **Para birimi çakışması.** Aynı hedef sütun farklı para birimlerinden besleniyorsa
-  (`Birim Fiyat (TL)` ve `price_usd`, ya da örneklerdeki `₺`/`$` işaretleri) ilgili
-  eşleştirmeler `review`'a düşer; dönüştürmeden birleştirmek değerleri karşılaştırılamaz kılar.
+- **Total ↔ per-unit.** When the target expects a per-item value and the source column is an
+  aggregate (total, amount, subtotal, VAT) — or the other way round — the match drops to
+  `review`. Example: `TUTAR` (2 × 10,00 = 20,00) → `unit_price`.
+- **Currency conflict.** When one target column is fed by different currencies
+  (`Birim Fiyat (TL)` and `price_usd`, or `₺`/`$` in the samples), those matches drop to
+  `review`: merging them without conversion makes the values incomparable.
 
-Aynı tuzaklar LLM'in sistem promptunda da yazılıdır; koruma, modelin kaçırdığı durumlar
-için ağdır.
+The same traps are spelled out in the LLM's system prompt, so the model usually lowers its own
+confidence; the guard is the net for the cases it misses.
 
 </details>
 
 <details>
-<summary><b>Validator — ayrıntı</b></summary>
+<summary><b>Validator — detail</b></summary>
 
-Dört denetim yapılır:
+Four checks run:
 
-- **tip** — hedef tür ile birleşik sütunun türü uyuşuyor mu; dönüştürülemeyen değerlerin oranı
-  yüksekse (varsayılan %20) muhtemelen yanlış sütun eşleşmiştir.
-- **null** — bir kaynak dosyada **eşlenmiş** olduğu hâlde boş kalan sütun. Sütunun hiç
-  eşlenmediği dosyalardan gelen boşluklar plan gereği olduğu için sayılmaz. Eşik
-  `--null-threshold` ile değişir (varsayılan `0.5`).
-- **aykırı değer** — sayısal sütunlarda IQR×3 çiti, tarihlerde makul yıl aralığı.
-- **required** — `required: true` hedef sütun eşlenmemişse ya da tek bir satırda bile boşsa hata.
+- **type** — does the target type match the merged column? A high share of unconvertible values
+  (20% by default) usually means the wrong column was matched.
+- **null** — a column that is **mapped** in a source file yet stays empty. Blanks from files
+  where the column was never mapped are by design and are not counted. The threshold is
+  `--null-threshold` (default `0.5`).
+- **outlier** — an IQR×3 fence on numeric columns, a plausible year range on dates.
+- **required** — an error when a `required: true` target column is unmapped or empty in even a
+  single row.
 
-`error` bulguları ilgili eşleştirmeyi `review`'a düşürür ve `apply`'ı durdurur; `warning`
-bulguları durdurmaz, `merge_report.xlsx` → `Validation` sayfasına yazılır. Validator veriyi
-hiçbir koşulda sessizce düzeltmez — yalnızca işaretler ve raporlar.
+`error` findings push the match back to `review` and stop `apply`; `warning` findings do not
+stop it and are written to the `Validation` sheet of `merge_report.xlsx`. The validator never
+silently fixes data — it flags and reports.
 
 </details>
 
 ---
 
-## 📄 Veri sözleşmeleri
+## 📄 Data contracts
 
-Üç YAML dosyası araç ile kullanıcı arasındaki sözleşmedir; hepsi `core/contracts.py`
-tarafından doğrulanır ve kayıpsız round-trip eder. Bozuk bir alan, satır numarasını ve
-beklenen değeri söyleyen bir hata verir.
+Three YAML files are the contract between the tool and you. All of them are validated by
+`core/contracts.py` and round-trip without loss; a malformed field produces an error naming the
+line and the expected value.
 
 <details>
-<summary><b><code>schema.yaml</code> — hedef şema (kullanıcı yazar)</b></summary>
+<summary><b><code>schema.yaml</code> — the target schema (you write it)</b></summary>
 
 ```yaml
 target_columns:
-  - name: product_name      # hedef sütun adı
+  - name: product_name      # target column name
     type: string            # string | integer | decimal | date | boolean
-    required: true          # true ise boş/eksik bırakılamaz (validator zorlar)
+    required: true          # when true it cannot be missing or empty (enforced by the validator)
   - name: unit_price
     type: decimal
     required: true
 output:
   format: xlsx              # xlsx | csv | sql
-  add_provenance: true      # provenance sütunları eklensin mi (önerilen: true)
+  add_provenance: true      # write provenance columns (recommended: true)
 ```
 
 </details>
 
 <details>
-<summary><b><code>mapping.yaml</code> — plan (analyze yazar, kullanıcı onaylar)</b></summary>
+<summary><b><code>mapping.yaml</code> — the plan (analyze writes it, you approve it)</b></summary>
 
-Her hedef sütun için **her kaynak dosyadan bir** eşleştirme satırı bulunur.
+There is one match row per target column **per source file**.
 
 ```yaml
 - target_column: unit_price
   sources:
-    - file: sales_2023.csv  # kaynak dosya adı (taşınabilir olsun diye yol değil)
-      column: birim_fiyat   # kaynak sütun; eşleşme yoksa null
+    - file: sales_2023.csv  # file name, not a path, so the plan stays portable
+      column: birim_fiyat   # source column; null when there is no match
       confidence: 0.97      # 0..1
       status: auto          # auto | review | unmatched
       reason: "Tür ve örnek değerler uyuşuyor."
 ```
 
-- `auto` — onaylı; `apply` bu sütunu birleştirir.
-- `review` — karar sizde; **tek bir `review` bile `apply`'ı durdurur**.
-- `unmatched` — bilinçli olarak eşlenmedi; hedef sütun o dosyanın satırlarında boş kalır,
-  satır atılmaz.
+- `auto` — approved; `apply` merges this column.
+- `review` — your call; **a single `review` stops `apply`**.
+- `unmatched` — deliberately not matched; the target column stays empty for that file's rows
+  and no row is dropped.
 
-Onaylamak için `status`'u `auto` yapın (gerekirse `column`'u düzeltin); vazgeçmek için
-`unmatched` yapıp `column: null` bırakın.
+To approve, set `status` to `auto` (fixing `column` if needed); to decline, set `unmatched` and
+leave `column: null`.
 
 </details>
 
 <details>
-<summary><b><code>clusters.yaml</code> — entity kümeleri (cluster yazar, kullanıcı onaylar)</b></summary>
+<summary><b><code>clusters.yaml</code> — entity clusters (cluster writes them, you approve them)</b></summary>
 
 ```yaml
 - cluster_id: c001
   target_column: product_name
-  canonical: Coca Cola 330ml     # members içindeki değerlerden biri olmalı
+  canonical: Coca Cola 330ml     # must be one of the member values
   status: review                 # auto | review | rejected
   members:
     - value: Coca Cola 330ml
@@ -268,7 +272,7 @@ Onaylamak için `status`'u `auto` yapın (gerekirse `column`'u düzeltin); vazge
     - value: Coca-Cola 33cl
       normalized: coca cola 330 ml
       row_count: 3
-  candidates:                    # onay bekleyen, henüz üye olmayan değerler
+  candidates:                    # proposed spellings, not members yet
     - value: coca cola zero 330ml
       similarity: 0.86
       suggestion: undecided      # same | different | undecided
@@ -278,28 +282,28 @@ Onaylamak için `status`'u `auto` yapın (gerekirse `column`'u düzeltin); vazge
   reason: "Gri bölgede bir aday var."
 ```
 
-- `status: auto` — küme onaylı; `apply` üyeleri canonical değere getirir.
-- `status: review` — onaysız; **hiçbir üye birleştirilmez**, raporda "belirsiz" görünür.
-- `status: rejected` — kullanıcı farklı ürün dedi; birleştirilmez, belirsiz de sayılmaz.
+- `status: auto` — approved; `apply` rewrites the members to the canonical value.
+- `status: review` — unapproved; **no member is merged**, and the report lists it as pending.
+- `status: rejected` — you said these are different products; not merged, not pending either.
 
-Bir adayı kabul etmek için `candidates`'tan `members`'a taşıyın; kümeyi bölmek için üyeyi
-listeden çıkarıp yeni bir `cluster_id` ile ayrı küme yazın. Bir değer yalnızca tek bir kümenin
-üyesi olabilir.
+To accept a candidate, move it from `candidates` to `members`; to split a cluster, remove the
+member and write it as a separate cluster with a new `cluster_id`. A value may belong to only
+one cluster.
 
 </details>
 
 <details>
-<summary><b>Provenance sütunları</b></summary>
+<summary><b>Provenance columns</b></summary>
 
-`add_provenance: true` iken çıktıya eklenen sütunlar:
+Written when `add_provenance: true`:
 
-| Sütun | Anlamı |
+| Column | Meaning |
 | --- | --- |
-| `_source_file` | Satırın geldiği dosya (çok sheet'te `dosya.xlsx#Sheet`) |
-| `<hedef>_source_column` | O hedef sütunun bu satırdaki kaynak sütun adı |
-| `_entity_cluster_id` | Satırın uygulandığı onaylı küme (entity resolution) |
-| `<hedef>_original_value` | Canonical'e getirilmeden önceki yazım |
-| `_merged_row_count` | Bu satırın temsil ettiği kaynak satır sayısı |
+| `_source_file` | The file the row came from (`book.xlsx#Sheet` for workbooks) |
+| `<target>_source_column` | The source column behind that target column, per row |
+| `_entity_cluster_id` | The approved cluster applied to this row (entity resolution) |
+| `<target>_original_value` | The spelling before it was rewritten to the canonical value |
+| `_merged_row_count` | How many source rows this row represents |
 
 </details>
 
@@ -307,179 +311,180 @@ listeden çıkarıp yeni bir `cluster_id` ile ayrı küme yazın. Bir değer yal
 
 ## 🔗 Entity resolution
 
-Aynı ürünün farklı yazımlarını tek ürüne indirmek isteğe bağlı bir adımdır ve onaylı bir
-`mapping.yaml` gerektirir:
+Folding different spellings of one product into a single value is an optional step and requires
+an approved `mapping.yaml`:
 
 ```bash
 merger cluster --mapping mapping.yaml --column product_name --out clusters.yaml
-# (clusters.yaml düzenlenir: status auto/rejected, aday taşıma, bölme)
+# (edit clusters.yaml: status auto/rejected, move candidates, split clusters)
 merger apply --mapping mapping.yaml --clusters clusters.yaml --out merged.xlsx
 ```
 
-Sıra şudur: **normalizasyon → blocking → embedding + iki eşik → yalnızca gri bölge için LLM**.
-Yüksek eşiğin üstü ve düşük eşiğin altı LLM'siz karara bağlanır; arada kalan az sayıda çift
-LLM'e sorulur ve **her hâlde `review` kalır** — otomatik birleşme yoktur. Sütunun yalnızca
-**farklı değerleri** karşılaştırılır, satır verisi sağlayıcıya gitmez.
+The order is: **normalisation → blocking → embeddings with two thresholds → the LLM for the
+grey zone only**. Everything above the high threshold and below the low one is decided without
+an LLM; the few pairs in between are asked, and the cluster **stays in `review` either way** —
+nothing merges automatically. Only the column's **distinct values** are compared, so row data
+never reaches a provider.
 
-Tekilleştirme yalnızca **entity çözümünün kendi yarattığı** yinelenmeleri siler: canonical
-değere getirildikten sonra tüm hedef sütunlarda aynılaşan satırlar tek satıra iner. Aynı yazımın
-gerçekten iki kez geçtiği satırlar (aynı ürünün iki ayrı satışı) korunur; hayatta kalan satır
-`_entity_cluster_id`, `<sütun>_original_value` ve `_merged_row_count` ile provenance'ı taşır.
+Deduplication removes only the duplicates **entity resolution itself created**: rows that become
+identical across every target column once the canonical value is applied. Rows where the same
+spelling genuinely occurs twice (two separate sales of one product) are kept, and the surviving
+row carries `_entity_cluster_id`, `<column>_original_value` and `_merged_row_count`.
 
-Embedding sağlayıcısı `EMBEDDING_PROVIDER` ile ayrı seçilir; `ollama` seçilirse karşılaştırılan
-adlar makineden çıkmaz.
+The embedding provider is chosen separately with `EMBEDDING_PROVIDER`; pick `ollama` and the
+compared names never leave your machine.
 
 ---
 
-## 🖥️ Web arayüzü
+## 🖥️ Web UI
 
-CLI ile web **aynı çekirdeği** kullanır: `web/backend` yalnızca sunum ve orkestrasyon
-katmanıdır, hiçbir iş mantığını ikinci kez yazmaz. Değişmez kararların hepsi API seviyesinde de
-geçerlidir.
+The CLI and the web app drive the **same core**: `web/backend` is presentation and
+orchestration only and never writes a business rule twice. Every invariant holds at the API
+level too.
 
-**Akış:** hesap oluştur → kendi anahtarını gir → dosyaları yükle → analiz → kartlarda onayla →
-birleştir → indir.
+**Flow:** create an account → enter your key → upload files → analyze → approve the cards →
+merge → download.
 
-| Kart | Durum | Anlamı |
+| Card | Status | Meaning |
 | --- | --- | --- |
-| 🟢 yeşil | `auto` | Otomatik eşleşti, onaylı. |
-| 🟡 sarı | `review` | Karar sizde; **birleştirmeyi durdurur**. |
-| 🔴 kırmızı | `unmatched` | Eşleşme yok; sütun seçin ya da boş bırakın. |
+| 🟢 green | `auto` | Matched automatically, approved. |
+| 🟡 amber | `review` | Your call; **it blocks the merge**. |
+| 🔴 red | `unmatched` | No match; pick a column or leave it empty. |
 
-Her kartta hedef sütun, kaynak dosya, güven yüzdesi, gerekçe ve örnek değerler görünür.
-Düzeltme dropdown iledir; seçenekler o dosyada **gerçekten var olan** sütunlardır, `(boş bırak)`
-ise sütunu bilinçli olarak eşlememek demektir. **"Birleştir" butonu yalnızca hiç `review`
-kalmadığında aktiftir**; backend aynı kuralı `409` ile uygular. Arayüz açık/koyu temayı işletim
-sisteminden alır.
+Each card shows the target column, the source file, the confidence, the reason and sample
+values. Corrections are made from a dropdown whose options are the columns that **actually
+exist** in that file; `(boş bırak)` means deliberately leaving it unmatched. **The merge button
+is enabled only when no `review` remains**, and the backend enforces the same rule with `409`.
+The interface follows your system's light/dark theme.
 
-Ayrıntı ve dağıtım seçenekleri: [`web/frontend/README.md`](web/frontend/README.md).
+More detail and deployment options: [`web/frontend/README.md`](web/frontend/README.md).
 
 <details>
-<summary><b>HTTP uçları ve durum kodları</b></summary>
+<summary><b>HTTP endpoints and status codes</b></summary>
 
-| Yöntem | Yol | Ne yapar |
-|--------|-----|----------|
-| `POST` | `/auth/register` | Hesap açar ve doğrudan oturum açar (`201`). |
-| `POST` | `/auth/login` | Giriş yapar, `Bearer` token döndürür. |
-| `POST` | `/auth/logout` | Oturumu kapatır; bellekteki anahtarı da unutur. |
-| `GET` | `/auth/me` | Kim giriş yapmış, anahtarı tanımlı mı. |
-| `GET` `PUT` `DELETE` | `/provider` | Kullanıcının sağlayıcı/model/anahtarı — **anahtar dönmez**. |
-| `POST` | `/upload` | Kaynak dosyalar + `schema.yaml` yükler, oturum açar (`201`). |
-| `POST` | `/analyze/{id}` | Faz 1: profil + LLM eşleştirme → plan döndürür. |
-| `GET` `PUT` | `/mapping/{id}` | Planı getirir / kullanıcının onayladığı planı yazar. |
-| `GET` | `/columns/{id}` | Kaynak dosyalardaki gerçek sütunlar (düzeltme dropdown'ı için). |
-| `POST` | `/cluster/{id}` | Faz 1b: bir sütun için entity kümeleri önerir. |
-| `GET` `PUT` | `/clusters/{id}` | Küme önerilerini getirir / onayları yazar. |
-| `POST` | `/apply/{id}` | Faz 2: LLM'siz birleştirme; review varsa `409`. |
-| `GET` | `/download/{id}/merged` · `/report` | `merged.<fmt>` ve `merge_report.xlsx`. |
-| `GET` | `/status/{id}` | Oturumun hangi adımda olduğu. |
-| `DELETE` | `/session/{id}` | Oturumu ve dosyalarını siler. |
-| `GET` | `/health` | Ayakta mı? |
+| Method | Path | What it does |
+|--------|------|--------------|
+| `POST` | `/auth/register` | Creates an account and signs it in (`201`). |
+| `POST` | `/auth/login` | Signs in and returns a `Bearer` token. |
+| `POST` | `/auth/logout` | Signs out; forgets the in-memory key too. |
+| `GET` | `/auth/me` | Who is signed in, and whether their key is held. |
+| `GET` `PUT` `DELETE` | `/provider` | The user's provider/model/key — **the key is never returned**. |
+| `POST` | `/upload` | Uploads sources + `schema.yaml` and opens a session (`201`). |
+| `POST` | `/analyze/{id}` | Phase 1: profiles + LLM matching → the plan. |
+| `GET` `PUT` | `/mapping/{id}` | Reads the plan / stores the approved plan. |
+| `GET` | `/columns/{id}` | The columns that exist in the sources (for the dropdown). |
+| `POST` | `/cluster/{id}` | Phase 1b: proposes entity clusters for one column. |
+| `GET` `PUT` | `/clusters/{id}` | Reads cluster proposals / stores approvals. |
+| `POST` | `/apply/{id}` | Phase 2: the LLM-free merge; `409` while a review remains. |
+| `GET` | `/download/{id}/merged` · `/report` | `merged.<fmt>` and `merge_report.xlsx`. |
+| `GET` | `/status/{id}` | Which step the session is on. |
+| `DELETE` | `/session/{id}` | Deletes the session and its files. |
+| `GET` | `/health` | Is it up? |
 
-`400` bozuk şema/plan/istek · `401` giriş gerekli ya da oturum süresi doldu · `404` bilinmeyen
-oturum, henüz üretilmemiş çıktı **ya da başkasının oturumu** · `409` review-guard veya
-validator'ın durdurduğu `apply` · `502` sağlayıcı isteği reddetti (`llm_request_failed`) ·
-`503` kullanıcının anahtarı yok (`llm_not_configured`).
+`400` malformed schema/plan/request · `401` sign-in required or session expired · `404` unknown
+session, an artifact that does not exist yet, **or someone else's session** · `409` an `apply`
+stopped by the review guard or the validator · `502` the provider refused the request
+(`llm_request_failed`) · `503` this user has no key (`llm_not_configured`).
 
-Etkileşimli dokümantasyon: `http://127.0.0.1:8000/docs`.
+Interactive documentation: `http://127.0.0.1:8000/docs`.
 
 </details>
 
 <details>
-<summary><b>Excel sheet davranışı</b></summary>
+<summary><b>Excel sheet behaviour</b></summary>
 
-Çok sheet'li bir `.xlsx` dosyasında varsayılan olarak **tüm sheet'ler** taranır.
-`--sheet <ad>` her komutta aynı anlama gelir: yalnızca o sheet okunur. Bayrak `.xlsx`
-kaynaklara uygulanır, CSV kaynaklar etkilenmez — karışık bir çalıştırmayı bölmek gerekmez.
+In a multi-sheet `.xlsx` file **every sheet** is read by default. `--sheet <name>` means the
+same thing in every command: read only that sheet. The flag applies to `.xlsx` sources and
+leaves CSV sources alone, so a mixed run does not need splitting.
 
 ```bash
 merger profile --input tests/fixtures/sample_multi_sheet.xlsx --sheet Stok
-merger analyze --inputs kitap.xlsx --target-schema schema.yaml --out mapping.yaml --sheet Satis
+merger analyze --inputs book.xlsx --target-schema schema.yaml --out mapping.yaml --sheet Satis
 merger apply --mapping mapping.yaml --out merged.csv --sheet Satis
 ```
 
-`--sheet` verilmezse:
+Without `--sheet`:
 
-- **`profile`**: her sheet ayrı bir tablo profili olarak listelenir.
-- **`analyze`**: dosyanın tüm sheet'lerindeki sütunlar o dosyanın aday sütunları sayılır.
-- **`apply` / `cluster`**: sheet'ler **dikey olarak alt alta eklenir**. O dosya için eşlenmiş
-  kaynak sütunlardan **hiçbirini içermeyen** bir sheet boş satır üretmemek için **atlanır**;
-  atlananlar komut çıktısında ve `merge_report.xlsx` → `Summary` → `skipped_sheets` satırında
-  listelenir.
-- Bir sheet birden fazlaysa `_source_file` satırın geldiği sheet'i de yazar: `kitap.xlsx#Satis`.
-- Eşlenmiş bir kaynak sütun dosyanın **hiçbir** sheet'inde yoksa `apply` hata verir (kod `2`);
-  olmayan bir `--sheet` adı verilirse mevcut sheet adları listelenir.
+- **`profile`**: every sheet is listed as its own table profile.
+- **`analyze`**: the columns of all sheets count as that file's candidates.
+- **`apply` / `cluster`**: sheets are **appended vertically**. A sheet that contains **none** of
+  the mapped source columns for that file is **skipped** so it cannot produce empty rows;
+  skipped sheets are listed in the command output and in `merge_report.xlsx` → `Summary` →
+  `skipped_sheets`.
+- When more than one sheet is read, `_source_file` records it too: `book.xlsx#Satis`.
+- If a mapped source column exists in **no** sheet of the file, `apply` fails (exit code `2`);
+  an unknown `--sheet` name lists the sheets that do exist.
 
 </details>
 
 ---
 
-## 🔐 Hesaplar, anahtarlar ve gizlilik
+## 🔐 Accounts, keys and privacy
 
-Anahtarlar **bize gitmez** ve hiçbir zaman kaynak koda yazılmaz. İki arayüzün anahtarı alma
-biçimi farklıdır:
+Keys **never come to us** and are never written into source code. The two interfaces take a key
+differently:
 
-- **CLI:** anahtarınızı `.env` dosyasına girersiniz; `.env` `.gitignore` içinde ilk satırdadır.
-- **Web:** her kullanıcı anahtarını arayüzden kendisi girer — açık bir kurulumda işletmecinin
-  anahtarı harcanmaz.
+- **CLI:** you put your key in `.env`, which is the first line of `.gitignore`.
+- **Web:** each user enters their own key in the interface — a public instance never spends the
+  operator's key.
 
-Web tarafındaki her uç giriş ister (`Authorization: Bearer <token>`). Saklama farkı bilinçlidir:
+Every web endpoint requires a sign-in (`Authorization: Bearer <token>`). The storage split is
+deliberate:
 
-| Ne | Nerede durur |
+| What | Where it lives |
 | --- | --- |
-| Hesap (e-posta, parola **scrypt** özeti + tuz), sağlayıcı ve model seçimi | SQLite dosyası (`users.db`) |
-| **API anahtarı** | Yalnızca sunucu sürecinin **belleğinde** |
+| The account (e-mail, **scrypt** password hash + salt), provider and model choice | A SQLite file (`users.db`) |
+| **The API key** | Only in the server process's **memory** |
 
 > [!WARNING]
-> Anahtar hiçbir koşulda veritabanına, oturum klasörüne ya da loga yazılmaz; `GET /provider` ve
-> `GET /auth/me` yalnızca sağlayıcıyı, modeli ve anahtarın tanımlı olup olmadığını bildirir —
-> maskelenmiş hâli bile dönmez. Çıkışta ve sunucu yeniden başladığında anahtar unutulur; bu,
-> "diske yazmama" sözünün kasıtlı bedelidir. Tarayıcıda yalnızca oturum token'ı saklanır.
+> The key is never written to the database, a session workspace or a log line. `GET /provider`
+> and `GET /auth/me` report only the provider, the model and whether a key is held — not even a
+> masked form of it. Signing out or restarting the server forgets it; that is the deliberate
+> price of the "never on disk" promise. The browser stores only the session token.
 
-Parolalar `hashlib.scrypt` ile (kullanıcıya özel tuz, `n=2^14`) özetlenir; aynı adrese art arda
-başarısız girişler kısa süreli yavaşlatılır. Başkasının oturumu `403` değil `404` döner — API,
-görmemesi gereken bir kimliğin varlığını doğrulamaz.
+Passwords are hashed with `hashlib.scrypt` (per-user salt, `n=2^14`), and repeated failed
+sign-ins for one address are briefly slowed down. Someone else's session answers `404`, not
+`403` — the API never confirms that an id it should not show you exists.
 
-`profile` ve `apply` hiçbir koşulda anahtar istemez — Faz 2 tamamen deterministiktir.
+`profile` and `apply` never ask for a key — Phase 2 is fully deterministic.
 
-Katkı verirken commit öncesi bir sızıntı taraması önerilir:
-[`gitleaks`](https://github.com/gitleaks/gitleaks) ya da `git-secrets`'i bir `pre-commit`
-kancasına bağlayın.
+A secret scan before committing is recommended for contributors: hook
+[`gitleaks`](https://github.com/gitleaks/gitleaks) or `git-secrets` into `pre-commit`.
 
 ---
 
-## 🌍 Dağıtım
+## 🌍 Deployment
 
-**1. Ortam değişkenleri**
+**1. Environment variables**
 
-| Değişken | Ne işe yarar | Varsayılan |
+| Variable | Purpose | Default |
 | --- | --- | --- |
-| `SCHEMA_MERGER_WEB_ROOT` | Oturum klasörlerinin kökü | geçici klasör |
-| `SCHEMA_MERGER_DB` | Hesap veritabanının yolu | `<web root>/users.db` |
-| `SCHEMA_MERGER_CORS_ORIGINS` | İzinli tarayıcı kaynakları | `http://localhost:5173` |
-| `LLM_PROVIDER` / `OPENAI_API_KEY` | Yalnızca **CLI** için | — |
+| `SCHEMA_MERGER_WEB_ROOT` | Root for session workspaces | a temporary folder |
+| `SCHEMA_MERGER_DB` | Path to the accounts database | `<web root>/users.db` |
+| `SCHEMA_MERGER_CORS_ORIGINS` | Allowed browser origins | `http://localhost:5173` |
+| `LLM_PROVIDER` / `OPENAI_API_KEY` | For the **CLI** only | — |
 
-İlk ikisi verilmezse hesaplar ve oturumlar yalnızca o çalıştırma boyunca yaşar; kalıcı bir
-kurulumda ikisini de verin.
+Without the first two, accounts and sessions live only for that run; set both for a persistent
+installation.
 
-**2. Tek süreç**
+**2. A single process**
 
-Oturumlar ve kullanıcıların anahtarları yalnızca sürecin belleğinde tutulur (anahtarın diske
-yazılmamasının bedeli). Bu yüzden uygulama tek işçiyle çalışır ve birden fazla işçi
-istendiğinde sessizce yanlış davranmak yerine **açılışta net bir hatayla durur**:
+Sessions and each user's key live only in the process's memory (the price of never writing a
+key to disk). The application therefore runs with one worker, and when more are requested it
+**stops at startup with a clear error** instead of misbehaving silently:
 
 ```bash
-uvicorn web.backend.main:app --host 0.0.0.0 --port 8000 --proxy-headers   # çalışır
-uvicorn web.backend.main:app --workers 4                                  # açılışta durur
+uvicorn web.backend.main:app --host 0.0.0.0 --port 8000 --proxy-headers   # works
+uvicorn web.backend.main:app --workers 4                                  # stops at startup
 ```
 
-Paylaşımlı bir oturum/anahtar deposu ekleyip bilinçli devam ediyorsanız
-`SCHEMA_MERGER_ALLOW_MULTIPROCESS=1` verin.
+If you have added a shared session/key store and want to proceed deliberately, set
+`SCHEMA_MERGER_ALLOW_MULTIPROCESS=1`.
 
-**3. TLS sonlandıran bir proxy**
+**3. A TLS-terminating proxy**
 
-Oturum token'ı ve API anahtarı isteklerde taşındığı için uygulama HTTPS arkasında durmalıdır.
-[Caddy](https://caddyserver.com/) ile birkaç satır yeter (sertifikayı kendisi alır):
+The session token and the API key travel in requests, so the app belongs behind HTTPS. A few
+lines of [Caddy](https://caddyserver.com/) are enough (it obtains the certificate itself):
 
 ```caddy
 merger.example.com {
@@ -492,101 +497,102 @@ merger.example.com {
 }
 ```
 
-Frontend'i `npm run build` ile derleyin (gerekirse `VITE_API_BASE=/api`) ve
-`SCHEMA_MERGER_CORS_ORIGINS`'i kendi alan adınıza daraltın.
+Build the frontend with `npm run build` (set `VITE_API_BASE=/api` if needed) and narrow
+`SCHEMA_MERGER_CORS_ORIGINS` to your own domain.
 
 ---
 
-## 🧪 Testler
+## 🧪 Tests
 
 ```bash
-pytest                                   # çekirdek + CLI + web backend (ağa çıkmaz)
-cd web/frontend && npm test              # React arayüzü (vitest)
+pytest                                   # core + CLI + web backend (never hits the network)
+cd web/frontend && npm test              # the React interface (vitest)
 
-SCHEMA_MERGER_LIVE=1 pytest -m live      # gerçek sağlayıcıya isabet testleri (ücretli)
+SCHEMA_MERGER_LIVE=1 pytest -m live      # accuracy tests against a real provider (paid)
 ```
 
-| Paket | Sayı | Ne doğrular |
+| Suite | Count | What it proves |
 | --- | --- | --- |
-| `pytest` | 235 | Çekirdek, CLI, web backend; satır kapsamı **%90** |
-| `vitest` | 22 | Kartlar, review-guard, giriş akışı, anahtarın tarayıcıda kalmaması |
-| `pytest -m live` | 7 | Gerçek modelin doğru sütunu seçmesi |
+| `pytest` | 235 | Core, CLI, web backend; **90%** line coverage |
+| `vitest` | 22 | Cards, the review guard, the sign-in flow, the key never staying in the browser |
+| `pytest -m live` | 7 | That a real model picks the right column |
 
-Testler ağa çıkmaz: LLM ve embedding sağlayıcıları `FakeLLMClient` / `FakeEmbeddingClient` ile
-enjekte edilir, `apply` tarafında ise bir istemcinin kurulmadığı ayrıca test edilir.
+The suites never reach the network: LLM and embedding providers are injected as
+`FakeLLMClient` / `FakeEmbeddingClient`, and `apply` is separately tested for building no client
+at all.
 
-`tests/live/` altındaki **isabet testleri** varsayılan koşuda hariç tutulur ve yapılandırılmış
-gerçek sağlayıcıya gider: diller/kısaltmalar arası eşleşme, olmayan sütunun uydurulmaması,
-toplam sütununun birim fiyata onaysız girmemesi, iki para biriminin sessizce birleşmemesi ve
-gerçek embedding'lerle ürün kümeleme. Model ifadeleri değil, yalnızca kararlar denetlenir.
+The **accuracy tests** under `tests/live/` are excluded from the default run and go to your
+configured provider: matching across languages and abbreviations, not inventing a column that
+does not exist, a total never entering a unit price unreviewed, two currencies never merging
+silently, and product clustering with real embeddings. They assert decisions, never wording.
 
 ---
 
-## 🧭 Kenar durumlar
+## 🧭 Edge cases
 
 <details>
-<summary><b>Çakışan değerler · tip çatışmaları · eksik anahtar · bozuk girdi</b></summary>
+<summary><b>Conflicting values · type conflicts · missing key · broken input</b></summary>
 
-**Çakışan değerler.** İki dosya aynı ürün için farklı fiyat söylüyorsa **iki satır da
-korunur**; hangisinin "doğru" olduğu otomatik seçilmez (kapsam dışı). Fark provenance ile
-izlenir: `_source_file` ve `<hedef>_source_column` her satırda kaynağı yazar,
-`merge_report.xlsx` → `Columns` sayfası aynı bilgiyi sütun bazında verir.
+**Conflicting values.** When two files give different prices for the same product, **both rows
+are kept**; which one is "right" is not chosen automatically (out of scope). The difference is
+traceable through provenance: `_source_file` and `<target>_source_column` name the source on
+every row, and `merge_report.xlsx` → `Columns` gives the same per column.
 
-**Tip çatışmaları.** Değerler hedef türe TR/EN normalizasyonuyla çevrilir (`12,50` ve `12.50`
-→ `12.5`; `31.12.2024`, `31/12/2024`, `2024-12-31` → tarih). Çevrilemeyen bir değer **sessizce
-silinmez**: hücre null olur, satır kalır, hata `merge_report` sayaçlarına yazılır ve komut
-çıktısında görünür. Oran validator eşiğini aşarsa eşleştirme `review`'a düşer ve `apply` durur.
+**Type conflicts.** Values are converted to the target type with Turkish/English normalisation
+(`12,50` and `12.50` → `12.5`; `31.12.2024`, `31/12/2024`, `2024-12-31` → a date). A value that
+cannot be converted is **never silently dropped**: the cell becomes null, the row stays, and the
+error is counted in `merge_report` and shown in the command output. If the share crosses the
+validator's threshold, the match falls back to `review` and `apply` stops.
 
-**API anahtarı yok.** `analyze` ve `cluster` bir sağlayıcı ister. Anahtar yoksa komut hiçbir
-dosya yazmadan durur ve eksik değişkeni adıyla söyler:
+**No API key.** `analyze` and `cluster` need a provider. Without a key the command stops before
+writing anything and names the missing variable:
 
 ```
 $ merger analyze --inputs sales.csv --target-schema schema.yaml --out mapping.yaml
 Error: OPENAI_API_KEY tanımlı değil, .env dosyanı kontrol et.
 ```
 
-(`LLM_PROVIDER=anthropic` ise `ANTHROPIC_API_KEY`; `ollama` yerel çalıştığı için anahtar
-istemez.)
+(`ANTHROPIC_API_KEY` when `LLM_PROVIDER=anthropic`; `ollama` runs locally and needs no key.)
 
-**Boş / bulunamayan girdi.** Olmayan dosya, desteklenmeyen uzantı (`.csv` ve `.xlsx` dışı),
-eksik hedef şema ve mapping'de adı geçip diskte olmayan kaynak, çıkış kodu `2` ile ve ne
-yapılacağını söyleyen bir mesajla bildirilir.
+**Empty or missing input.** A missing file, an unsupported extension (anything but `.csv` and
+`.xlsx`), a missing target schema, and a source named in the plan but absent from disk are all
+reported with exit code `2` and a message that says what to do.
 
 </details>
 
 ---
 
-## 📜 Değişmez kararlar
+## 📜 Invariants
 
-> Projenin tasarım kararları; hepsi kodda ve testlerde korunur.
+> The project's design decisions; every one of them is held by code and tests.
 
-1. **Yalnızca dikey birleştirme** (union/append). Yatay join kapsam dışıdır.
-2. **`analyze` → kullanıcı onayı → `apply`** iki fazlı akış; tek adımda birleştirme yok.
-3. **LLM satır verisini işlemez.** LLM'e yalnızca sütun profilleri, entity adımında ise sütunun
-   farklı değerleri gider.
-4. Her eşleştirme **confidence + status + gerekçe** taşır.
-5. Planda çözülmemiş **`review` kalırsa `apply` durur** ve hiçbir çıktı yazmaz.
-6. **Provenance her zaman** yazılır: hangi satır hangi dosya ve sütundan geldi.
-7. **API anahtarı asla repoya girmez**: CLI'da `.env` ile verilir, web'de her kullanıcı kendi
-   anahtarını girer ve anahtar yalnızca sunucu belleğinde tutulur, yanıtlarda dönmez.
-8. Önce **çekirdek + CLI**; UI daha sonra **aynı çekirdeği** kullanır.
+1. **Vertical merges only** (union/append). Horizontal joins are out of scope.
+2. **`analyze` → human approval → `apply`**; there is no one-step merge.
+3. **The LLM never processes rows.** It receives column profiles, and in the entity step the
+   distinct values of one column.
+4. Every match carries **confidence + status + a reason**.
+5. If an unresolved **`review` remains, `apply` stops** and writes nothing.
+6. **Provenance is always written**: which row came from which file and column.
+7. **An API key never enters the repository**: the CLI takes it from `.env`, and on the web each
+   user enters their own, which is held in server memory only and never returned.
+8. **Core and CLI first**; the UI came later and drives the **same core**.
 
 ---
 
-## 📌 Kapsam
+## 📌 Scope
 
-**Hazır:** profil → plan → onay → deterministik birleştirme → rapor; validator ve semantik
-tuzak koruması; entity resolution (normalizasyon → blocking → embedding → gri bölge LLM → küme
-onayı → tekilleştirme); çok kullanıcılı web arayüzü (hesap, kullanıcı başına anahtar/model,
-kart tabanlı onay ekranı, koyu tema).
+**Done:** profile → plan → approval → deterministic merge → report; the validator and the
+semantic trap guards; entity resolution (normalisation → blocking → embeddings → grey-zone LLM
+→ cluster approval → deduplication); a multi-user web interface (accounts, per-user key and
+model, card-based approval screen, dark theme).
 
-**Kapsam dışı:** yatay join, canlı veritabanları ve SQL dump'ları, `.csv`/`.xlsx` dışındaki
-girdi biçimleri, çakışan değerler arasında otomatik seçim.
+**Out of scope:** horizontal joins, live databases and SQL dumps, input formats other than
+`.csv`/`.xlsx`, and choosing automatically between conflicting values.
 
 ---
 
 <div align="center">
 
-**MIT lisanslı** — bkz. [LICENSE](LICENSE)
+**MIT licensed** — see [LICENSE](LICENSE)
 
 </div>
